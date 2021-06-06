@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const child_process = require('child_process');
+const split = require('graphemesplit');
 
 // Running unit tests for the extension inside VSCode:
 // 1. In console in rainbow_csv directory run `npm install` - OK to run the command in WSL while launching in Windows. This will install the dependencies, including vscode/lib/testrunner
@@ -15,7 +16,7 @@ const child_process = require('child_process');
 // You can also run this command from wsl terminal!
 
 // Debugging the extension:
-// 1. Open rainbow_csv directory in VSCode  
+// 1. Open rainbow_csv directory in VSCode
 // 2. Make sure you have "Extension" run mode enabled
 // 3. Click "Run" or F5
 
@@ -416,6 +417,21 @@ function produce_lint_report(active_doc, delim, policy, config) {
     return 'OK';
 }
 
+function grapheme_cluster_width(str){
+  let count = 0;
+  let grapheme_clusters = split(str);
+  for(let i = 0; i < grapheme_clusters.length; i++){
+    const first_char = grapheme_clusters[i].codePointAt(0);
+    if(grapheme_clusters[i].length > 1){
+      count += 2;
+    }else if(first_char > 0x7f){
+      count += 2;
+    }else if(first_char >= 0x20 && first_char < 0x7f){
+      count += 1;
+    }
+  }
+  return count;
+}
 
 function calc_column_sizes(active_doc, delim, policy) {
     let result = [];
@@ -433,7 +449,7 @@ function calc_column_sizes(active_doc, delim, policy) {
         for (let i = 0; i < fields.length; i++) {
             if (result.length <= i)
                 result.push(0);
-            result[i] = Math.max(result[i], (fields[i].trim()).length);
+            result[i] = Math.max(result[i], grapheme_cluster_width(fields[i].trim()));
         }
     }
     return [result, null];
@@ -458,7 +474,7 @@ function shrink_columns(active_doc, delim, policy) {
         }
         for (let i = 0; i < fields.length; i++) {
             let adjusted = fields[i].trim();
-            if (fields[i].length != adjusted.length) {
+            if (fields[i] != adjusted) {
                 fields[i] = adjusted;
                 has_edit = true;
             }
@@ -488,7 +504,7 @@ function align_columns(active_doc, delim, policy, column_sizes) {
             if (i >= column_sizes.length) // Safeguard against async doc edit
                 break;
             let adjusted = fields[i].trim();
-            let delta_len = column_sizes[i] - adjusted.length;
+            let delta_len = column_sizes[i] - grapheme_cluster_width(adjusted);
             if (delta_len >= 0) { // Safeguard against async doc edit
                 adjusted += ' '.repeat(delta_len + 1);
             }
