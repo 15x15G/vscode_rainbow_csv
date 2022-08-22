@@ -5,14 +5,14 @@ const webpack = require('webpack');
 /** @type WebpackConfig */
 const webExtensionConfig = {
   mode: 'none', // this leaves the source code as close as possible to the original (when packaging we set this to 'production')
-  target: 'node', // extensions run in a webworker context
+  target: 'webworker', // extensions run in a webworker context
   entry: {
     extension: './extension.js', // source of the web extension main file
-    //'test/suite/index': './test/suite/index.js' // Source of web extension test runner.
+    'test/suite/index': './test/suite/index.js' // Source of web extension test runner.
   },
   output: {
     filename: '[name].js', // The name will be replaced with the key from the `entry` section i.e. by `extension` - because it is the only key in entry for this particular config.
-    path: path.join(__dirname, './dist'),
+    path: path.join(__dirname, './dist/web'),
     // devtoolModuleFilenameTemplate: '../../[resource-path]',
     libraryTarget: 'commonjs' // value from a fixed dictionary.
   },

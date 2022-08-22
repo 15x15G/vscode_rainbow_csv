@@ -1,7 +1,9 @@
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
-
+const Graphemer = require('graphemer').default;
+const split = new Graphemer().splitGraphemes;
+const easta = require('easta');
 const rbql = require('./rbql_core/rbql-js/rbql.js');
 const rbql_csv = require('./rbql_core/rbql-js/rbql_csv.js');
 const csv_utils = require('./rbql_core/rbql-js/csv_utils.js');
@@ -60,7 +62,7 @@ function get_default_python_udf_content() {
 function update_subcomponent_stats(field, is_first_line, max_field_components_lens) {
     // Extract overall field length and length of integer and fractional parts of the field if it represents a number.
     // Here `max_field_components_lens` is a tuple: (max_field_length, max_integer_part_length, max_fractional_part_length)
-    if (field.length > max_field_components_lens[0]) {
+    if (grapheme_cluster_width(field) > max_field_components_lens[0]) {
         max_field_components_lens[0] = grapheme_cluster_width(field);
     }
     if (max_field_components_lens[1] == non_numeric_sentinel) {
@@ -82,21 +84,19 @@ function update_subcomponent_stats(field, is_first_line, max_field_components_le
     max_field_components_lens[2] = Math.max(max_field_components_lens[2], cur_fractional_part_length);
 }
 
-const split = require('graphemesplit');
 function grapheme_cluster_width(str){
-  let count = 0;
-  let grapheme_clusters = split(str);
-  for(let i = 0; i < grapheme_clusters.length; i++){
-    const first_char = grapheme_clusters[i].codePointAt(0);
-    if(grapheme_clusters[i].length > 1){
-      count += 2;
-    }else if(first_char > 0x7f){
-      count += 2;
-    }else if(first_char >= 0x20 && first_char < 0x7f){
-      count += 1;
-    }
-  }
-  return count;
+    const eastah = ["A", "H", "N", "Na"];
+    let count = 0;
+    let grapheme_clusters = split(str);
+    grapheme_clusters.forEach(element => {
+        if (eastah.includes(easta(element))) {
+            count += 1;
+        }
+        else {
+            count += 2;
+        }
+    });
+    return count;
 }
 
 function calc_column_stats(active_doc, delim, policy, comment_prefix) {
