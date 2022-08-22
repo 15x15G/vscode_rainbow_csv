@@ -424,5 +424,8 @@
     "repository": {
         "type": "git",
         "url": "https://github.com/mechatroner/vscode_rainbow_csv"
+    },
+    "dependencies": {
+        "graphemesplit": "^2.4.3"
     }
 }
