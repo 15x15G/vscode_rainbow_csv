@@ -6,6 +6,10 @@ To install it, you should first disable the original extension.
 
 安装前请先禁用原版插件。
 
+Please use a monospaced font (e.g. `inconsolata`) for the best experience
+
+请使用等宽字体（如 `inconsolata`）获得最佳体验
+
 #
 
 # Rainbow CSV
