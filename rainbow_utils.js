@@ -61,7 +61,7 @@ function update_subcomponent_stats(field, is_first_line, max_field_components_le
     // Extract overall field length and length of integer and fractional parts of the field if it represents a number.
     // Here `max_field_components_lens` is a tuple: (max_field_length, max_integer_part_length, max_fractional_part_length)
     if (field.length > max_field_components_lens[0]) {
-        max_field_components_lens[0] = field.length;
+        max_field_components_lens[0] = grapheme_cluster_width(field);
     }
     if (max_field_components_lens[1] == non_numeric_sentinel) {
         // Column is not a number, early return.
@@ -82,6 +82,22 @@ function update_subcomponent_stats(field, is_first_line, max_field_components_le
     max_field_components_lens[2] = Math.max(max_field_components_lens[2], cur_fractional_part_length);
 }
 
+const split = require('graphemesplit');
+function grapheme_cluster_width(str){
+  let count = 0;
+  let grapheme_clusters = split(str);
+  for(let i = 0; i < grapheme_clusters.length; i++){
+    const first_char = grapheme_clusters[i].codePointAt(0);
+    if(grapheme_clusters[i].length > 1){
+      count += 2;
+    }else if(first_char > 0x7f){
+      count += 2;
+    }else if(first_char >= 0x20 && first_char < 0x7f){
+      count += 1;
+    }
+  }
+  return count;
+}
 
 function calc_column_stats(active_doc, delim, policy, comment_prefix) {
     let column_stats = [];
@@ -145,13 +161,13 @@ function align_field(field, is_first_line, max_field_components_lens, is_last_co
     const extra_readability_whitespace_length = 1;
     field = field.trim();
     if (max_field_components_lens[1] == non_numeric_sentinel) {
-        let delta_length = Math.max(max_field_components_lens[0] - field.length, 0);
+        let delta_length = Math.max(max_field_components_lens[0] - grapheme_cluster_width(field), 0);
         return is_last_column ? field : field + ' '.repeat(delta_length + extra_readability_whitespace_length);
     }
     if (is_first_line) {
         if (number_regex.exec(field) === null) {
             // The line must be a header - align it using max_width rule.
-            let delta_length = Math.max(max_field_components_lens[0] - field.length, 0);
+            let delta_length = Math.max(max_field_components_lens[0] - grapheme_cluster_width(field), 0);
             return is_last_column ? field : field + ' '.repeat(delta_length + extra_readability_whitespace_length);
         }
     }
