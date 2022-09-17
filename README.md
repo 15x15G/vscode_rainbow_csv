@@ -33,14 +33,16 @@ Another way to do this: select one separator character with mouse cursor -> righ
 
 #### Supported separators
 
-| Language name    | Separator     | Extension | Properties                          |
-| ---------------- | ------------- | --------- | ----------------------------------- |
-| csv              | , (comma)     | .csv      | Ignored inside double-quoted fields |
-| tsv              | \t (TAB)      | .tsv .tab |                                     |
-| csv (semicolon)  | ; (semicolon) |           | Ignored inside double-quoted fields |
-| csv (whitespace) | whitespace    |           | Consecutive whitespaces are merged  |
-| csv (pipe)       | &#124; (pipe) |           |                                     |
-| csv (...)        | ~ ^ : " = . - |           |                                     |
+|Language name    | Separator            | Extension | Properties                          |
+|-----------------|----------------------|-----------|-------------------------------------|
+|csv              | , (comma)            | .csv      | Ignored inside double-quoted fields |
+|tsv              | \t (TAB)             | .tsv .tab |                                     |
+|csv (semicolon)  | ; (semicolon)        |           | Ignored inside double-quoted fields |
+|csv (whitespace) | whitespace           |           | Consecutive whitespaces are merged  |
+|csv (pipe)       | &#124; (pipe)        |           |                                     |
+|csv (...)        | ~ ^ : " = . -        |           |                                     |
+|dynamic csv      | any char or string   |           |                                     |
+
 
 #### Content-based separator autodetection
 
@@ -69,6 +71,7 @@ For example to associate ".dat" extension with pipe-separated files and ".csv" w
 
 Important: language identifiers in the config must be specified in **lower case**! E.g. use `csv (semicolon)`, not `CSV (semicolon)`.  
 List of supported language ids: `"csv", "tsv", "csv (semicolon)", "csv (pipe)", "csv (whitespace)", "csv (tilde)", "csv (caret)", "csv (colon)", "csv (double quote)", "csv (equals)", "csv (dot)", "csv (hyphen)"`
+
 
 #### CSVLint consistency check
 
@@ -102,13 +105,12 @@ There you can find the list of available options and their description.
 
 ### Commands:
 
-#### RBQL
-
-Enter RBQL - SQL-like language query editing mode.
-
 #### Align, Shrink
 
 Align columns with whitespaces or shrink them (remove leading/trailing whitespaces)
+
+#### Set separator
+Set the currently selected text (single character or multiline string) as a separator and re-highlight the file.
 
 #### ColumnEditBefore, ColumnEditAfter, ColumnEditSelect
 
@@ -125,6 +127,9 @@ Input a comma-separated string with column names to adjust column names displaye
 
 Uses the current line to adjust column names displayed in hover tooltips. Actual header line and file content won't be affected.
 This is a "Virtual" header and will be persistent and will be associated with the parent file across VSCode sessions.
+
+#### RBQL
+Enter RBQL - SQL-like language query editing mode.
 
 #### SetJoinTableName
 
@@ -168,8 +173,8 @@ Screenshot of RBQL Console:
 
 #### Disadvantages:
 
-- Rainbow CSV may be less effective for CSV files with many (> 10) columns.
-- Rainbow CSV can't correctly handle newlines inside double-quoted CSV fields (well, theorethically it can, but only under specific conditions)
+* Rainbow CSV may be less effective for CSV files with many (> 10) columns and for files with multiline fields, although textual alignment can significantly improve the situation.  
+
 
 ### References
 

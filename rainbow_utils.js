@@ -8,8 +8,17 @@ const rbql = require('./rbql_core/rbql-js/rbql.js');
 const rbql_csv = require('./rbql_core/rbql-js/rbql_csv.js');
 const csv_utils = require('./rbql_core/rbql-js/csv_utils.js');
 
+const fast_load_utils = require('./fast_load_utils.js');
+
 const non_numeric_sentinel = -1;
 const number_regex = /^([0-9]+)(\.[0-9]+)?$/;
+
+// Copypasted from extension.js
+const QUOTED_RFC_POLICY = 'quoted_rfc';
+const QUOTED_POLICY = 'quoted';
+const dynamic_csv_highlight_margin = 50; // TODO make configurable.
+const max_preview_field_length = 250;
+
 
 class AssertionError extends Error {}
 
@@ -247,39 +256,6 @@ function shrink_columns(active_doc, delim, policy, comment_prefix) {
 }
 
 
-function get_last(arr) {
-    return arr[arr.length - 1];
-}
-
-
-function populate_optimistic_rfc_csv_record_map(document, requested_end_record, dst_record_map, comment_prefix=null) {
-    let num_lines = document.lineCount;
-    let record_begin = null;
-    let start_line_idx = dst_record_map.length ? get_last(dst_record_map)[1] : 0;
-    for (let lnum = start_line_idx; lnum < num_lines && dst_record_map.length < requested_end_record; ++lnum) {
-        let line_text = document.lineAt(lnum).text;
-        if (lnum + 1 >= num_lines && line_text == "")
-            break; // Skip the last empty line.
-        if (comment_prefix && line_text.startsWith(comment_prefix))
-            continue;
-        let match_list = line_text.match(/"/g);
-        let has_unbalanced_double_quote = match_list && match_list.length % 2 == 1;
-        if (record_begin === null && !has_unbalanced_double_quote) {
-            dst_record_map.push([lnum, lnum + 1]);
-        } else if (record_begin === null && has_unbalanced_double_quote) {
-            record_begin = lnum;
-        } else if (!has_unbalanced_double_quote) {
-            continue;
-        } else {
-            dst_record_map.push([record_begin, lnum + 1]);
-            record_begin = null;
-        }
-    }
-    if (record_begin !== null) {
-        dst_record_map.push([record_begin, num_lines]);
-    }
-}
-
 
 function make_table_name_key(file_path) {
     return 'rbql_table_name:' + file_path;
@@ -353,22 +329,11 @@ function get_header_line(document, comment_prefix) {
 
 
 function make_inconsistent_num_fields_warning(table_name, inconsistent_records_info) {
-    let keys = Object.keys(inconsistent_records_info);
-    let entries = [];
-    for (let i = 0; i < keys.length; i++) {
-        let key = keys[i];
-        let record_id = inconsistent_records_info[key];
-        entries.push([record_id, key]);
-    }
-    entries.sort(function(a, b) { return a[0] - b[0]; });
-    assert(entries.length > 1);
-    let [record_1, num_fields_1] = entries[0];
-    let [record_2, num_fields_2] = entries[1];
+    let [record_num_1, num_fields_1, record_num_2, num_fields_2] = rbql.sample_first_two_inconsistent_records(inconsistent_records_info);
     let warn_msg = `Number of fields in "${table_name}" table is not consistent: `;
-    warn_msg += `e.g. record ${record_1} -> ${num_fields_1} fields, record ${record_2} -> ${num_fields_2} fields`;
+    warn_msg += `e.g. record ${record_num_1 + 1} -> ${num_fields_1} fields, record ${record_num_2 + 1} -> ${num_fields_2} fields`;
     return warn_msg;
 }
-
 
 
 class RbqlIOHandlingError extends Error {}
@@ -377,38 +342,30 @@ class VSCodeRecordIterator extends rbql.RBQLInputIterator {
     constructor(document, delim, policy, has_header=false, comment_prefix=null, table_name='input', variable_prefix='a') {
         // We could have done a hack here actually: convert the document to stream/buffer and then use the standard reader.
         super();
-        this.document = document;
-        this.delim = delim;
-        this.policy = policy;
         this.has_header = has_header;
-        this.comment_prefix = comment_prefix;
         this.table_name = table_name;
         this.variable_prefix = variable_prefix;
         this.NR = 0; // Record number.
         this.NL = 0; // Line number (NL != NR when the CSV file has comments or multiline fields).
-        this.fields_info = new Object();
-        this.first_defective_line = null;
-        this.first_record = this.get_first_record();
+        let fail_on_warning = policy == 'quoted_rfc';
+        [this.records, _num_records_parsed, this.fields_info, this.first_defective_line, this._first_trailing_space_line] = fast_load_utils.parse_document_records(document, delim, policy, comment_prefix, fail_on_warning);
+        if (fail_on_warning && this.first_defective_line !== null) {
+            throw new RbqlIOHandlingError(`Inconsistent double quote escaping in ${this.table_name} table at record ${this.records.length}, line ${this.first_defective_line}`);
+        }
+        this.first_record = this.records.length ? this.records[0] : [];
+        this.next_record_index = 0;
     }
 
     stop() {
-    }
-
-    get_first_record() {
-        let header_line = get_header_line(this.document, this.comment_prefix);
-        let first_record = csv_utils.smart_split(header_line, this.delim, this.policy, /*preserve_quotes_and_whitespaces=*/false)[0];
-        return first_record;
     }
 
     async get_variables_map(query_text) {
         let variable_map = new Object();
         rbql.parse_basic_variables(query_text, this.variable_prefix, variable_map);
         rbql.parse_array_variables(query_text, this.variable_prefix, variable_map);
-        let header_line = get_header_line(this.document, this.comment_prefix);
-        let first_record = csv_utils.smart_split(header_line, this.delim, this.policy, /*preserve_quotes_and_whitespaces=*/false)[0];
         if (this.has_header) {
-            rbql.parse_attribute_variables(query_text, this.variable_prefix, first_record, 'CSV header line', variable_map);
-            rbql.parse_dictionary_variables(query_text, this.variable_prefix, first_record, variable_map);
+            rbql.parse_attribute_variables(query_text, this.variable_prefix, this.first_record, 'CSV header line', variable_map);
+            rbql.parse_dictionary_variables(query_text, this.variable_prefix, this.first_record, variable_map);
         }
         return variable_map;
     }
@@ -417,49 +374,12 @@ class VSCodeRecordIterator extends rbql.RBQLInputIterator {
         return this.has_header ? this.first_record : null;
     }
 
-    get_line_rfc() {
-        let rfc_line_buffer = [];
-        const num_lines = this.document.lineCount;
-        while (this.NL < num_lines) {
-            let line = this.document.lineAt(this.NL).text;
-            this.NL += 1;
-            if (this.NL == num_lines && line.length == 0)
-                return null; // Skip the last line if it is empty - this can happen due to trailing newline.
-            let record_line = csv_utils.accumulate_rfc_line_into_record(rfc_line_buffer, line, this.comment_prefix);
-            if (record_line !== null)
-                return record_line;
-        }
-        return null;
-    }
-
-    get_line_simple() {
-        const num_lines = this.document.lineCount;
-        while (this.NL < num_lines) {
-            let line = this.document.lineAt(this.NL).text;
-            this.NL += 1;
-            if (this.NL == num_lines && line.length == 0)
-                return null; // Skip the last line if it is empty - this can happen due to trailing newline.
-            if (this.comment_prefix === null || !line.startsWith(this.comment_prefix))
-                return line;
-        }
-        return null;
-    }
-
     do_get_record() {
-        let line = (this.policy == 'quoted_rfc') ? this.get_line_rfc() : this.get_line_simple();
-        if (line === null)
+        if (this.next_record_index >= this.records.length) {
             return null;
-        let [record, warning] = csv_utils.smart_split(line, this.delim, this.policy, /*preserve_quotes_and_whitespaces=*/false);
-        if (warning) {
-            if (this.first_defective_line === null) {
-                this.first_defective_line = this.NL;
-                if (this.policy == 'quoted_rfc')
-                    throw new RbqlIOHandlingError(`Inconsistent double quote escaping in ${this.table_name} table at record ${this.NR}, line ${this.NL}`);
-            }
         }
-        let num_fields = record.length;
-        if (!this.fields_info.hasOwnProperty(num_fields))
-            this.fields_info[num_fields] = this.NR;
+        let record = this.records[this.next_record_index];
+        this.next_record_index += 1;
         return record;
     }
 
@@ -476,7 +396,7 @@ class VSCodeRecordIterator extends rbql.RBQLInputIterator {
         let result = [];
         if (this.first_defective_line !== null)
             result.push(`Inconsistent double quote escaping in ${this.table_name} table. E.g. at line ${this.first_defective_line}`);
-        if (Object.keys(this.fields_info).length > 1)
+        if (this.fields_info.size > 1)
             result.push(make_inconsistent_num_fields_warning(this.table_name, this.fields_info));
         return result;
     }
@@ -674,13 +594,316 @@ async function rbql_query_node(vscode_global_state, query_text, input_path, inpu
 }
 
 
+function make_multiline_record_ranges(vscode, delim_length, newline_marker, fields, start_line, expected_end_line_for_control) {
+    // Semantic ranges in VSCode can't span multiple lines, so we use this workaround.
+    let record_ranges = [];
+    let lnum_current = start_line;
+    let pos_in_editor_line = 0;
+    let next_pos_in_editor_line = 0;
+    for (let i = 0; i < fields.length; i++) {
+        let pos_in_logical_field = 0;
+        // Group tokens belonging to the same logical field.
+        let logical_field_tokens = [];
+        while (true) {
+            let newline_marker_pos = fields[i].indexOf(newline_marker, pos_in_logical_field);
+            if (newline_marker_pos == -1)
+                break;
+            logical_field_tokens.push(new vscode.Range(lnum_current, pos_in_editor_line, lnum_current, pos_in_editor_line + newline_marker_pos - pos_in_logical_field));
+            lnum_current += 1;
+            pos_in_editor_line = 0;
+            next_pos_in_editor_line = 0;
+            pos_in_logical_field = newline_marker_pos + newline_marker.length;
+        }
+        next_pos_in_editor_line += fields[i].length - pos_in_logical_field;
+        if (i + 1 < fields.length) {
+            next_pos_in_editor_line += delim_length;
+        }
+        logical_field_tokens.push(new vscode.Range(lnum_current, pos_in_editor_line, lnum_current, next_pos_in_editor_line));
+        record_ranges.push(logical_field_tokens);
+        // From semantic tokenization perspective the end of token doesn't include the last character of vscode.Range i.e. it treats the range as [) interval, unlike the Range.contains() function which treats ranges as [] intervals.
+        pos_in_editor_line = next_pos_in_editor_line;
+    }
+    assert(lnum_current == expected_end_line_for_control);
+    return record_ranges;
+}
+
+
+function is_opening_rfc_line(line_text, delim) {
+    // The line is oppening if by adding a character (to avoid accidental double double quote) and single double quote at the end we can make it parsable without warning!
+    // Some lines can be simultaneously opening and closing, e.g. `",a1,a2` or `a1,a2,"`
+    let [_record, warning] = csv_utils.split_quoted_str(line_text + 'x"', delim);
+    return !warning;
+}
+
+
+function parse_document_range_rfc(vscode, doc, delim, comment_prefix, range, custom_parsing_margin=null) {
+    if (custom_parsing_margin === null) {
+        custom_parsing_margin = dynamic_csv_highlight_margin;
+    }
+    let begin_line = Math.max(0, range.start.line - custom_parsing_margin);
+    let end_line = Math.min(doc.lineCount, range.end.line + custom_parsing_margin);
+    let table_ranges = [];
+    let line_aggregator = new csv_utils.MultilineRecordAggregator(comment_prefix);
+    // The first or the second line in range with an odd number of double quotes is a start line, after finding it we can use the standard parsing algorithm.
+    for (let lnum = begin_line; lnum < end_line; lnum++) {
+        let line_text = doc.lineAt(lnum).text;
+        if (lnum + 1 == doc.lineCount && !line_text)
+            break;
+        let inside_multiline_record_before = line_aggregator.is_inside_multiline_record();
+        let start_line = lnum - line_aggregator.get_num_lines_in_record();
+        line_aggregator.add_line(line_text);
+        let inside_multiline_record_after = line_aggregator.is_inside_multiline_record();
+        if (!inside_multiline_record_before && inside_multiline_record_after) {
+            // Must be an odd-num line, check if this is an openning line - otherwise reset ranges.
+            if (!is_opening_rfc_line(line_text, delim)) {
+                table_ranges = [];
+                line_aggregator.reset();
+            }
+        }
+        if (line_aggregator.has_comment_line) {
+            table_ranges.push({comment_range: new vscode.Range(lnum, 0, lnum, line_text.length)});
+            line_aggregator.reset();
+        } else if (line_aggregator.has_full_record) {
+            const newline_marker = '\r\n'; // Use '\r\n' here to guarantee that this sequence is not present anywhere in the lines themselves.
+            let combined_line = line_aggregator.get_full_line(newline_marker);
+            line_aggregator.reset();
+            let [fields, warning] = csv_utils.smart_split(combined_line, delim, QUOTED_POLICY, /*preserve_quotes_and_whitespaces=*/true);
+            if (!warning) {
+                table_ranges.push({record_ranges: make_multiline_record_ranges(vscode, delim.length, newline_marker, fields, start_line, lnum)});
+            }
+        }
+    }
+    return table_ranges;
+}
+
+
+function parse_document_range_single_line(vscode, doc, delim, policy, comment_prefix, range) {
+    let table_ranges = [];
+    let begin_line = Math.max(0, range.start.line - dynamic_csv_highlight_margin);
+    let end_line = Math.min(doc.lineCount, range.end.line + dynamic_csv_highlight_margin);
+    for (let lnum = begin_line; lnum < end_line; lnum++) {
+        let record_ranges = [];
+        let line_text = doc.lineAt(lnum).text;
+        if (lnum + 1 == doc.lineCount && !line_text)
+            break;
+        if (comment_prefix && line_text.startsWith(comment_prefix)) {
+            table_ranges.push({comment_range: new vscode.Range(lnum, 0, lnum, line_text.length)});
+            continue;
+        }
+        let split_result = csv_utils.smart_split(line_text, delim, policy, /*preserve_quotes_and_whitespaces=*/true);
+        // TODO consider handling comments and warnings
+        let fields = split_result[0];
+        let cpos = 0;
+        let next_cpos = 0;
+        for (let i = 0; i < fields.length; i++) {
+            next_cpos += fields[i].length;
+            if (i + 1 < fields.length) {
+                next_cpos += delim.length;
+            }
+            record_ranges.push([new vscode.Range(lnum, cpos, lnum, next_cpos)]);
+            // From semantic tokenization perspective the end of token doesn't include the last character of vscode.Range i.e. it treats the range as [) interval, unlike the Range.contains() function which treats ranges as [] intervals.
+            cpos = next_cpos;
+        }
+        table_ranges.push({record_ranges: record_ranges});
+    }
+    return table_ranges;
+}
+
+
+function parse_document_range(vscode, doc, delim, policy, comment_prefix, range) {
+    if (policy == QUOTED_RFC_POLICY) {
+        return parse_document_range_rfc(vscode, doc, delim, comment_prefix, range);
+    } else {
+        return parse_document_range_single_line(vscode, doc, delim, policy, comment_prefix, range);
+    }
+}
+
+
+function get_field_by_line_position(fields, delim_length, query_pos) {
+    if (!fields.length)
+        return null;
+    var col_num = 0;
+    var cpos = fields[col_num].length + delim_length;
+    while (query_pos > cpos && col_num + 1 < fields.length) {
+        col_num += 1;
+        cpos = cpos + fields[col_num].length + delim_length;
+    }
+    return col_num;
+}
+
+
+function get_cursor_position_info_rfc(vscode, document, delim, comment_prefix, position) {
+    const hover_parse_margin = 20;
+    let range = new vscode.Range(Math.max(position.line - hover_parse_margin, 0), 0, position.line + hover_parse_margin, 0);
+    let table_ranges = parse_document_range_rfc(vscode, document, delim, comment_prefix, range);
+    let last_found_position_info = null; // Use last found instead of first found because cursor position at the border can belong to two ranges simultaneously.
+    for (let row_info of table_ranges) {
+        if (row_info.hasOwnProperty('comment_range')) {
+            if (row_info.comment_range.contains(position)) {
+                last_found_position_info = {is_comment: true};
+            }
+        } else {
+            for (let col_num = 0; col_num < row_info.record_ranges.length; col_num++) {
+                // One logical field can map to multiple ranges if it spans multiple lines.
+                for (let record_range of row_info.record_ranges[col_num]) {
+                    if (record_range.contains(position)) {
+                        last_found_position_info = {column_number: col_num, total_columns: row_info.record_ranges.length, split_warning: false};
+                    }
+                }
+            }
+        }
+    }
+    return last_found_position_info;
+}
+
+
+function get_cursor_position_info_standard(document, delim, policy, comment_prefix, position) {
+    var lnum = position.line;
+    var cnum = position.character;
+    var line = document.lineAt(lnum).text;
+
+    if (comment_prefix && line.startsWith(comment_prefix))
+        return {is_comment: true};
+
+    let [entries, warning] = csv_utils.smart_split(line, delim, policy, true);
+    var col_num = get_field_by_line_position(entries, delim.length, cnum + 1);
+    if (col_num == null)
+        return null;
+    return {column_number: col_num, total_columns: entries.length, split_warning: warning};
+}
+
+
+function get_cursor_position_info(vscode, document, delim, policy, comment_prefix, position) {
+    if (policy === null)
+        return null;
+    if (policy == QUOTED_RFC_POLICY) {
+        return get_cursor_position_info_rfc(vscode, document, delim, comment_prefix, position);
+    } else {
+        return get_cursor_position_info_standard(document, delim, policy, comment_prefix, position);
+    }
+}
+
+
+function format_cursor_position_info(cursor_position_info, header, show_column_names, show_comments, max_label_length) {
+    if (cursor_position_info.is_comment) {
+        if (show_comments) {
+            return ['Comment', 'Comment'];
+        } else {
+            return [null, null];
+        }
+    }
+    let short_report = 'Col ' + (cursor_position_info.column_number + 1);
+    let full_report = '[Rainbow CSV] ' + short_report;
+    if (show_column_names && cursor_position_info.column_number < header.length) {
+        let column_label = header[cursor_position_info.column_number].trim();
+        let short_column_label = column_label.substr(0, max_label_length);
+        if (short_column_label != column_label)
+            short_column_label = short_column_label + '...';
+        short_report += ': ' + short_column_label;
+        full_report += ': ' + column_label;
+    }
+    if (cursor_position_info.split_warning) {
+        full_report += '; ERR: Inconsistent double quotes in line';
+    } else if (header.length != cursor_position_info.total_columns) {
+        full_report += `; WARN: Inconsistent num of fields, header: ${header.length}, this line: ${cursor_position_info.total_columns}`;
+    }
+    return [full_report, short_report];
+}
+
+
+function sample_records(document, delim, policy, comment_prefix, end_record, preview_window_size, stop_on_warning, cached_table_parse_result) {
+    let records = [];
+    let _fields_info = null;
+    let first_failed_line = null;
+    let vscode_doc_version = null;
+    let _first_trailing_space_line = null;
+    // Here `preview_window_size` is typically 100.
+    if (end_record < preview_window_size * 5) {
+        // Re-sample the records. Re-sampling top records is fast and it ensures that all manual changes are mirrored into RBQL console.
+        [records, _num_records_parsed, _fields_info, first_failed_line, _first_trailing_space_line] = fast_load_utils.parse_document_records(document, delim, policy, comment_prefix, stop_on_warning, /*max_records_to_parse=*/end_record, /*collect_records=*/true);
+    } else {
+        let need_full_doc_parse = true;
+        if (cached_table_parse_result.has(document.fileName)) {
+            [records, first_failed_line, vscode_doc_version] = cached_table_parse_result.get(document.fileName);
+            if (document.version === vscode_doc_version) {
+                need_full_doc_parse = false;
+            }
+        }
+        if (need_full_doc_parse) {
+            let [records, _num_records_parsed, _fields_info, first_failed_line, _first_trailing_space_line] = fast_load_utils.parse_document_records(document, delim, policy, comment_prefix, stop_on_warning, /*max_records_to_parse=*/-1, /*collect_records=*/true);
+            cached_table_parse_result.set(document.fileName, [records, first_failed_line, document.version]);
+        }
+        [records, first_failed_line, vscode_doc_version] = cached_table_parse_result.get(document.fileName);
+    }
+    return [records, first_failed_line];
+}
+
+
+function sample_preview_records_from_context(rbql_context, dst_message, preview_window_size, cached_table_parse_result) {
+    let [document, delim, policy, comment_prefix] = [rbql_context.input_document, rbql_context.delim, rbql_context.policy, rbql_context.comment_prefix];
+    rbql_context.requested_start_record = Math.max(rbql_context.requested_start_record, 0);
+    let stop_on_warning = policy == QUOTED_RFC_POLICY;
+    let [records, first_failed_line] = sample_records(document, delim, policy, comment_prefix, rbql_context.requested_start_record + preview_window_size, preview_window_size, stop_on_warning, cached_table_parse_result);;
+    if (first_failed_line !== null && policy == QUOTED_RFC_POLICY) {
+        dst_message.preview_sampling_error = `Double quotes are not consistent in record ${records.length + 1} which starts at line ${first_failed_line + 1}`;
+        return;
+    }
+    rbql_context.requested_start_record = Math.max(0, Math.min(rbql_context.requested_start_record, records.length - preview_window_size));
+    let preview_records = records.slice(rbql_context.requested_start_record, rbql_context.requested_start_record + preview_window_size);
+
+    // Here we trim excessively long fields. The only benefit of doing is here instead of UI layer is to minimize the ammount of traffic that we send to UI - the total message size is limited.
+    for (let r = 0; r < preview_records.length; r++) {
+        let cur_record = preview_records[r];
+        for (let c = 0; c < cur_record.length; c++) {
+            if (cur_record[c].length > max_preview_field_length) {
+                cur_record[c] = cur_record[c].substr(0, max_preview_field_length) + '###UI_STRING_TRIM_MARKER###';
+            }
+        }
+    }
+    dst_message.preview_records = preview_records;
+    dst_message.actual_start_record = rbql_context.requested_start_record;
+}
+
+
+function show_lint_status_bar_button(vscode, extension_context, file_path, language_id) {
+    let lint_cache_key = `${file_path}.${language_id}`;
+    if (!extension_context.lint_results.has(lint_cache_key))
+        return;
+    var lint_report = extension_context.lint_results.get(lint_cache_key);
+    if (!extension_context.lint_status_bar_button)
+        extension_context.lint_status_bar_button = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
+    extension_context.lint_status_bar_button.text = 'CSVLint';
+    let lint_report_msg = '';
+    if (lint_report.is_processing) {
+        extension_context.lint_status_bar_button.color = '#A0A0A0';
+        lint_report_msg = 'Processing';
+    } else if (Number.isInteger(lint_report.first_defective_line)) {
+        lint_report_msg = `Error. Line ${lint_report.first_defective_line} has formatting error: double quote chars are not consistent`;
+        extension_context.lint_status_bar_button.color = '#f44242';
+    } else if (lint_report.fields_info && lint_report.fields_info.size > 1) {
+        let [record_num_1, num_fields_1, record_num_2, num_fields_2] = rbql.sample_first_two_inconsistent_records(lint_report.fields_info);
+        lint_report_msg = `Error. Number of fields is not consistent: e.g. record ${record_num_1 + 1} has ${num_fields_1} fields, and record ${record_num_2 + 1} has ${num_fields_2} fields`;
+        extension_context.lint_status_bar_button.color = '#f44242';
+    } else if (Number.isInteger(lint_report.first_trailing_space_line)) {
+        lint_report_msg = `Leading/Trailing spaces detected: e.g. at line ${lint_report.first_trailing_space_line + 1}. Run "Shrink" command to remove them`;
+        extension_context.lint_status_bar_button.color = '#ffff28';
+    } else {
+        assert(lint_report.is_ok);
+        extension_context.lint_status_bar_button.color = '#62f442';
+        lint_report_msg = 'OK';
+    }
+    extension_context.lint_status_bar_button.tooltip = lint_report_msg + '\nClick to recheck';
+    extension_context.lint_status_bar_button.command = 'rainbow-csv.CSVLint';
+    extension_context.lint_status_bar_button.show();
+}
+
+
 module.exports.make_table_name_key = make_table_name_key;
 module.exports.find_table_path = find_table_path;
 module.exports.read_header = read_header;
 module.exports.rbql_query_web = rbql_query_web;
 module.exports.rbql_query_node = rbql_query_node;
 module.exports.get_header_line = get_header_line;
-module.exports.populate_optimistic_rfc_csv_record_map = populate_optimistic_rfc_csv_record_map;
 module.exports.get_default_js_udf_content = get_default_js_udf_content;
 module.exports.get_default_python_udf_content = get_default_python_udf_content;
 module.exports.align_columns = align_columns;
@@ -689,3 +912,13 @@ module.exports.calc_column_stats = calc_column_stats;
 module.exports.adjust_column_stats = adjust_column_stats;
 module.exports.update_subcomponent_stats = update_subcomponent_stats;
 module.exports.align_field = align_field;
+module.exports.assert = assert;
+module.exports.get_field_by_line_position = get_field_by_line_position;
+module.exports.get_cursor_position_info = get_cursor_position_info;
+module.exports.format_cursor_position_info = format_cursor_position_info;
+module.exports.parse_document_range = parse_document_range;
+module.exports.sample_preview_records_from_context = sample_preview_records_from_context;
+module.exports.parse_document_range_rfc = parse_document_range_rfc; // Only for unit tests.
+module.exports.sample_first_two_inconsistent_records = rbql.sample_first_two_inconsistent_records;
+module.exports.is_opening_rfc_line = is_opening_rfc_line; // Only for unit tests.
+module.exports.show_lint_status_bar_button = show_lint_status_bar_button;

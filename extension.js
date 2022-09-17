@@ -5,6 +5,8 @@ const fs = require('fs');
 const os = require('os');
 const child_process = require('child_process');
 
+const fast_load_utils = require('./fast_load_utils.js');
+
 // Please see DEV_README.md file for additional info.
 
 const csv_utils = require('./rbql_core/rbql-js/csv_utils.js');
@@ -19,33 +21,30 @@ function ll_rbql_csv() {
 
 var rainbow_utils = null; // Using lazy load to improve startup performance.
 function ll_rainbow_utils() {
-    if (rainbow_utils === null)
+    if (rainbow_utils === null) {
         rainbow_utils = require('./rainbow_utils.js');
+    }
     return rainbow_utils;
 }
 
 
 const is_web_ext = (os.homedir === undefined); // Runs as web extension in browser.
 const preview_window_size = 100;
-const max_preview_field_length = 250;
 const scratch_buf_marker = 'vscode_rbql_scratch';
+const dynamic_csv_highlight_margin = 50; // TODO make configurable
 
 let client_html_template_web = null;
 
-var lint_results = new Map();
 var aligned_files = new Set();
-var autodetection_stoplist = new Set();
-var original_language_ids = new Map();
 var result_set_parent_map = new Map();
+var cached_table_parse_result = new Map(); // TODO store doc timestamp / size to invalidate the entry when the doc changes.
+var manual_comment_prefix_stoplist = new Set();
 
-var lint_status_bar_button = null;
 var rbql_status_bar_button = null;
 var align_shrink_button = null;
 var rainbow_off_status_bar_button = null;
 var copy_back_button = null;
 var column_info_button = null;
-
-let last_statusbar_doc = null;
 
 var rbql_context = null;
 
@@ -57,7 +56,7 @@ var global_state = null;
 
 var preview_panel = null;
 
-var doc_edit_subscription = null;
+var doc_first_edit_subscription = null;
 var keyboard_cursor_subscription = null;
 
 var _unit_test_last_rbql_report = null; // For unit tests only.
@@ -65,20 +64,66 @@ var _unit_test_last_warnings = null; // For unit tests only.
 
 let cursor_timeout_handle = null;
 
+let rainbow_token_event = null;
+let comment_token_event = null;
+
+const DYNAMIC_CSV = 'dynamic csv';
+
+const QUOTED_POLICY = 'quoted';
+const WHITESPACE_POLICY = 'whitespace';
+const QUOTED_RFC_POLICY = 'quoted_rfc';
+const SIMPLE_POLICY = 'simple';
+
+let extension_context = {lint_results: new Map(), lint_status_bar_button: null, custom_document_dialects: new Map(), original_language_ids: new Map(), autodetection_stoplist: new Set()};
+
 const dialect_map = {
-    'csv': [',', 'quoted'],
-    'tsv': ['\t', 'simple'],
-    'csv (semicolon)': [';', 'quoted'],
-    'csv (pipe)': ['|', 'simple'],
-    'csv (tilde)': ['~', 'simple'],
-    'csv (caret)': ['^', 'simple'],
-    'csv (colon)': [':', 'simple'],
-    'csv (double quote)': ['"', 'simple'],
-    'csv (equals)': ['=', 'simple'],
-    'csv (dot)': ['.', 'simple'],
-    'csv (whitespace)': [' ', 'whitespace'],
-    'csv (hyphen)': ['-', 'simple']
+    'csv': [',', QUOTED_POLICY],
+    'tsv': ['\t', SIMPLE_POLICY],
+    'csv (semicolon)': [';', QUOTED_POLICY],
+    'csv (pipe)': ['|', SIMPLE_POLICY],
+    'csv (tilde)': ['~', SIMPLE_POLICY],
+    'csv (caret)': ['^', SIMPLE_POLICY],
+    'csv (colon)': [':', SIMPLE_POLICY],
+    'csv (double quote)': ['"', SIMPLE_POLICY],
+    'csv (equals)': ['=', SIMPLE_POLICY],
+    'csv (dot)': ['.', SIMPLE_POLICY],
+    'csv (whitespace)': [' ', WHITESPACE_POLICY],
+    'csv (hyphen)': ['-', SIMPLE_POLICY],
+    [DYNAMIC_CSV]: [null, null]
 };
+
+const tokenTypes = ['rainbow1', 'macro', 'function', 'comment', 'string', 'parameter', 'type', 'enumMember', 'keyword', 'regexp'];
+const tokens_legend = new vscode.SemanticTokensLegend(tokenTypes);
+
+
+function safe_lower(src_str) {
+    if (!src_str)
+        return src_str;
+    return src_str.toLowerCase();
+}
+
+
+function get_default_policy(separator) {
+    // This function is most likely a temporal workaround, get rid of it when possible.
+    for (let language_id in dialect_map) {
+        if (!dialect_map.hasOwnProperty(language_id))
+            continue;
+        if (dialect_map[language_id][0] == separator)
+            return dialect_map[language_id][1];
+    }
+    return SIMPLE_POLICY;
+}
+
+
+function map_dialect_to_language_id(separator, policy) {
+    for (let language_id in dialect_map) {
+        if (!dialect_map.hasOwnProperty(language_id))
+            continue;
+        if (dialect_map[language_id][0] == separator && dialect_map[language_id][1] == policy)
+            return language_id;
+    }
+    return DYNAMIC_CSV;
+}
 
 
 // This structure will get properly initialized during the startup.
@@ -112,17 +157,6 @@ async function push_current_stack_to_js_callback_queue_to_allow_ui_update() {
 }
 
 
-function map_separator_to_language_id(separator) {
-    for (let language_id in dialect_map) {
-        if (!dialect_map.hasOwnProperty(language_id))
-            continue;
-        if (dialect_map[language_id][0] == separator)
-            return language_id;
-    }
-    return null;
-}
-
-
 function get_from_global_state(key, default_value) {
     if (global_state) {
         var value = global_state.get(key);
@@ -142,66 +176,10 @@ async function save_to_global_state(key, value) {
 }
 
 
-function get_rfc_record_text(document, record_start, record_end) {
-    let result = [];
-    for (let i = record_start; i < record_end && i < document.lineCount; i++) {
-        result.push(document.lineAt(i).text);
-    }
-    return result.join('\n');
-}
-
-
 async function replace_doc_content(active_editor, active_doc, new_content) {
     let invalid_range = new vscode.Range(0, 0, active_doc.lineCount /* Intentionally missing the '-1' */, 0);
     let full_range = active_doc.validateRange(invalid_range);
     await active_editor.edit(edit => edit.replace(full_range, new_content));
-}
-
-
-function sample_preview_records_from_context(rbql_context, dst_message) {
-    let document = rbql_context.input_document;
-    let delim = rbql_context.delim;
-    let policy = rbql_context.policy;
-
-    rbql_context.requested_start_record = Math.max(rbql_context.requested_start_record, 0);
-
-    let preview_records = [];
-    if (rbql_context.enable_rfc_newlines) {
-        let requested_end_record = rbql_context.requested_start_record + preview_window_size;
-        ll_rainbow_utils().populate_optimistic_rfc_csv_record_map(document, requested_end_record, rbql_context.rfc_record_map);
-        rbql_context.requested_start_record = Math.max(0, Math.min(rbql_context.requested_start_record, rbql_context.rfc_record_map.length - preview_window_size));
-        for (let nr = rbql_context.requested_start_record; nr < rbql_context.rfc_record_map.length && preview_records.length < preview_window_size; nr++) {
-            let [record_start, record_end] = rbql_context.rfc_record_map[nr];
-            let record_text = get_rfc_record_text(document, record_start, record_end);
-            let [cur_record, warning] = csv_utils.smart_split(record_text, delim, policy, false);
-            if (warning) {
-                dst_message.preview_sampling_error = `Double quotes are not consistent in record ${nr + 1} which starts at line ${record_start + 1}`;
-                return;
-            }
-            preview_records.push(cur_record);
-        }
-    } else {
-        let num_records = document.lineCount;
-        if (document.lineAt(Math.max(num_records - 1, 0)).text == '')
-            num_records -= 1;
-        rbql_context.requested_start_record = Math.max(0, Math.min(rbql_context.requested_start_record, num_records - preview_window_size));
-        for (let nr = rbql_context.requested_start_record; nr < num_records && preview_records.length < preview_window_size; nr++) {
-            let line_text = document.lineAt(nr).text;
-            let cur_record = csv_utils.smart_split(line_text, delim, policy, false)[0];
-            preview_records.push(cur_record);
-        }
-    }
-
-    for (let r = 0; r < preview_records.length; r++) {
-        let cur_record = preview_records[r];
-        for (let c = 0; c < cur_record.length; c++) {
-            if (cur_record[c].length > max_preview_field_length) {
-                cur_record[c] = cur_record[c].substr(0, max_preview_field_length) + '###UI_STRING_TRIM_MARKER###';
-            }
-        }
-    }
-    dst_message.preview_records = preview_records;
-    dst_message.start_record_zero_based = rbql_context.requested_start_record;
 }
 
 
@@ -210,30 +188,26 @@ function make_header_key(file_path) {
 }
 
 
-function make_rfc_policy_key(file_path) {
-    return 'enable_rfc_newlines:' + file_path;
-}
-
-
 function make_with_headers_key(file_path) {
     return 'rbql_with_headers:' + file_path;
 }
 
 
-function get_from_config(param_name, default_value) {
-    const config = vscode.workspace.getConfiguration('rainbow_csv');
+function get_from_config(param_name, default_value, config=null) {
+    if (!config) {
+        config = vscode.workspace.getConfiguration('rainbow_csv');
+    }
     return config ? config.get(param_name) : default_value;
 }
 
 
-function get_header_from_document(document, delim, policy) {
-    let comment_prefix = get_from_config('comment_prefix', '');
+function get_header_from_document(document, delim, policy, comment_prefix) {
     let header_line = ll_rainbow_utils().get_header_line(document, comment_prefix);
     return csv_utils.smart_split(header_line, delim, policy, /*preserve_quotes_and_whitespaces=*/false)[0];
 }
 
 
-function get_header(document, delim, policy) {
+function get_header(document, delim, policy, comment_prefix) {
     var file_path = document.fileName;
     if (file_path) {
         let raw_header = get_from_global_state(make_header_key(file_path), null);
@@ -241,187 +215,117 @@ function get_header(document, delim, policy) {
             return JSON.parse(raw_header);
         }
     }
-    return get_header_from_document(document, delim, policy);
+    return get_header_from_document(document, delim, policy, comment_prefix);
 }
 
 
-function get_field_by_line_position(fields, query_pos) {
-    if (!fields.length)
-        return null;
-    var col_num = 0;
-    var cpos = fields[col_num].length + 1;
-    while (query_pos > cpos && col_num + 1 < fields.length) {
-        col_num += 1;
-        cpos = cpos + fields[col_num].length + 1;
-    }
-    return col_num;
-}
-
-
-function make_hover_text(document, position, language_id, enable_tooltip_column_names, enable_tooltip_warnings) {
-    let [delim, policy] = dialect_map[language_id];
-    var lnum = position.line;
-    var cnum = position.character;
-    var line = document.lineAt(lnum).text;
-
+function get_dialect(document) {
+    let language_id = document.languageId;
+    let delim = null;
+    let policy = null;
     let comment_prefix = get_from_config('comment_prefix', '');
-    if (comment_prefix && line.startsWith(comment_prefix))
-        return 'Comment';
-
-    var report = csv_utils.smart_split(line, delim, policy, true);
-
-    var entries = report[0];
-    var warning = report[1];
-    var col_num = get_field_by_line_position(entries, cnum + 1);
-
-    if (col_num == null)
-        return null;
-    var result = 'Col ' + (col_num + 1);
-
-    var header = get_header(document, delim, policy);
-    if (enable_tooltip_column_names && col_num < header.length) {
-        const max_label_len = 50;
-        let column_label = header[col_num].trim();
-        var short_column_label = column_label.substr(0, max_label_len);
-        if (short_column_label != column_label)
-            short_column_label = short_column_label + '...';
-        result += ', ' + short_column_label;
+    if (extension_context.custom_document_dialects.has(document.fileName)) {
+        let dialect_info = extension_context.custom_document_dialects.get(document.fileName);
+        // This check allows to override default comment_prefix with an empty string from user selection to disable comment prefix in selected files.
+        if (dialect_info.hasOwnProperty('comment_prefix') && dialect_info.comment_prefix !== null) {
+            comment_prefix = dialect_info.comment_prefix;
+        }
+        delim = dialect_info.delim;
+        policy = dialect_info.policy;
     }
-    if (enable_tooltip_warnings) {
-        if (warning) {
-            result += '; ERR: Inconsistent double quotes in line';
-        } else if (header.length != entries.length) {
-            result += `; WARN: Inconsistent num of fields, header: ${header.length}, this line: ${entries.length}`;
+    if (language_id == DYNAMIC_CSV) {
+        return [delim, policy, comment_prefix];
+    }
+    if (!dialect_map.hasOwnProperty(language_id)) {
+        return [null, null, null];
+    }
+    [delim, policy] = dialect_map[language_id];
+    return [delim, policy, comment_prefix];
+}
+
+
+function show_status_bar_items(active_doc) {
+    ll_rainbow_utils().show_lint_status_bar_button(vscode, extension_context, active_doc.fileName, active_doc.languageId);
+    show_rbql_status_bar_button();
+    show_align_shrink_button(active_doc.fileName);
+    show_rainbow_off_status_bar_button();
+    show_rbql_copy_to_source_button(active_doc.fileName);
+    show_column_info_button(); // This function finds active_doc internally, but the possible inconsistency is harmless.
+}
+
+
+function enable_dynamic_semantic_tokenization() {
+    let token_provider = new RainbowTokenProvider();
+    if (rainbow_token_event !== null) {
+        rainbow_token_event.dispose();
+    }
+    let document_selector = { language: DYNAMIC_CSV }; // Use '*' to select all languages if needed.
+    rainbow_token_event = vscode.languages.registerDocumentRangeSemanticTokensProvider(document_selector, token_provider, tokens_legend);
+}
+
+
+function enable_comment_tokenization() {
+    let token_provider = new CommentTokenProvider();
+    if (comment_token_event !== null) {
+        comment_token_event.dispose();
+    }
+    let document_selector = [];
+    for (let language_id in dialect_map) {
+        if (dialect_map.hasOwnProperty(language_id) && language_id != DYNAMIC_CSV) {
+            // We skip DYNAMIC_CSV here because its provider already handles comment lines.
+            document_selector.push({language: language_id});
         }
     }
-    return result;
+    comment_token_event = vscode.languages.registerDocumentRangeSemanticTokensProvider(document_selector, token_provider, tokens_legend);
 }
 
 
-function make_status_info(document, position, language_id, enable_tooltip_column_names) {
-    let [delim, policy] = dialect_map[language_id];
-    var lnum = position.line;
-    var cnum = position.character;
-    var line = document.lineAt(lnum).text;
-
-    let comment_prefix = get_from_config('comment_prefix', '');
-    if (comment_prefix && line.startsWith(comment_prefix))
-        return null;
-
-    var report = csv_utils.smart_split(line, delim, policy, true);
-
-    var entries = report[0];
-    var warning = report[1];
-    if (warning)
-        return null;
-    var col_num = get_field_by_line_position(entries, cnum + 1);
-
-    if (col_num == null)
-        return null;
-    var result = 'CSV: ' + (col_num + 1);
-
-    var header = get_header(document, delim, policy);
-    if (header.length != entries.length)
-        return null;
-
-    if (enable_tooltip_column_names && col_num < header.length) {
-        let column_label = header[col_num].trim();
-        result += ', ' + column_label;
-    }
-    return result;
-}
-
-
-function refresh_status_bar_items(active_doc=null) {
-    if (!active_doc)
-        active_doc = get_active_doc();
-    last_statusbar_doc = active_doc;
-    var file_path = active_doc ? active_doc.fileName : null;
-    if (!active_doc || !file_path) {
+async function enable_rainbow_features_if_csv(active_doc) {
+    let file_path = active_doc ? active_doc.fileName : null;
+    if (!active_doc || !file_path || file_path.endsWith('.git')) {
         // For new untitled scratch documents `file_path` would be "Untitled-1", "Untitled-2", etc, so we won't enter this branch.
-        hide_status_bar_buttons();
+        // Sometimes for git-controlled dirs VSCode opens mysterious .git files - skip them.
         return;
     }
-    if (file_path.endsWith('.git')) {
-        // Sometimes for git-controlled dirs VSCode opens mysterious .git files. Skip them, don't hide buttons.
-        return;
-    }
-    hide_status_bar_buttons();
     var language_id = active_doc.languageId;
-    if (!dialect_map.hasOwnProperty(language_id))
+    if (!dialect_map.hasOwnProperty(language_id)) {
         return;
-    show_lint_status_bar_button(file_path, language_id);
-    show_rbql_status_bar_button();
-    show_align_shrink_button(file_path);
-    show_rainbow_off_status_bar_button();
-    show_rbql_copy_to_source_button(file_path);
-    show_column_info_button();
+    }
+
     if (get_from_config('enable_cursor_position_info', false)) {
         keyboard_cursor_subscription = vscode.window.onDidChangeTextEditorSelection(handle_cursor_movement);
     }
+
+    if (language_id == DYNAMIC_CSV) {
+        // Re-enable tokenization to explicitly trigger the highligthing. Sometimes this doesn't happen automatically.
+        enable_dynamic_semantic_tokenization();
+    }
+    show_status_bar_items(active_doc);
+    await csv_lint(active_doc, false);
 }
 
 
-function make_hover(document, position, language_id, cancellation_token) {
-    if (last_statusbar_doc != document) {
-        refresh_status_bar_items(document); // Being paranoid and making sure that the buttons are visible.
-    }
-    if (!get_from_config('enable_tooltip', false)) {
+function disable_rainbow_features_if_non_csv(active_doc) {
+    let file_path = active_doc ? active_doc.fileName : null;
+    if (!active_doc) {
         return;
     }
-    let enable_tooltip_column_names = get_from_config('enable_tooltip_column_names', false);
-    let enable_tooltip_warnings = get_from_config('enable_tooltip_warnings', false);
-    var hover_text = make_hover_text(document, position, language_id, enable_tooltip_column_names, enable_tooltip_warnings);
-    if (hover_text && !cancellation_token.isCancellationRequested) {
-        let mds = null;
-        try {
-            mds = new vscode.MarkdownString();
-            mds.appendCodeblock(hover_text, 'rainbow hover markup');
-        } catch (e) {
-            mds = hover_text; // Older VSCode versions may not have MarkdownString/appendCodeblock functionality.
-        }
-        return new vscode.Hover(mds);
-    } else {
-        return null;
+    if (file_path && file_path.endsWith('.git')) {
+        // Sometimes for git-controlled dirs VSCode opens mysterious .git files which are not even present - skip them, don't disable features.
+        return;
     }
-}
-
-
-function produce_lint_report(active_doc, delim, policy) {
-    let comment_prefix = get_from_config('comment_prefix', '');
-    let detect_trailing_spaces = get_from_config('csv_lint_detect_trailing_spaces', false);
-    let first_trailing_space_line = null;
-    var num_lines = active_doc.lineCount;
-    var num_fields = null;
-    for (var lnum = 0; lnum < num_lines; lnum++) {
-        var line_text = active_doc.lineAt(lnum).text;
-        if (lnum + 1 == num_lines && !line_text)
-            break;
-        if (comment_prefix && line_text.startsWith(comment_prefix))
-            continue;
-        var split_result = csv_utils.smart_split(line_text, delim, policy, true);
-        if (split_result[1]) {
-            return 'Error. Line ' + (lnum + 1) + ' has formatting error: double quote chars are not consistent';
-        }
-        if (detect_trailing_spaces && first_trailing_space_line === null) {
-            let fields = split_result[0];
-            for (let i = 0; i < fields.length; i++) {
-                if (fields[i].length && (fields[i].charAt(0) == ' ' || fields[i].slice(-1) == ' ')) {
-                    first_trailing_space_line = lnum;
-                }
-            }
-        }
-        if (!num_fields) {
-            num_fields = split_result[0].length;
-        }
-        if (num_fields != split_result[0].length) {
-            return 'Error. Number of fields is not consistent: e.g. line 1 has ' + num_fields + ' fields, and line ' + (lnum + 1) + ' has ' + split_result[0].length + ' fields.';
-        }
+    var language_id = active_doc.languageId;
+    if (dialect_map.hasOwnProperty(language_id))
+        return;
+    let all_buttons = [extension_context.lint_status_bar_button, rbql_status_bar_button, rainbow_off_status_bar_button, copy_back_button, align_shrink_button, column_info_button];
+    for (let i = 0; i < all_buttons.length; i++) {
+        if (all_buttons[i])
+            all_buttons[i].hide();
     }
-    if (first_trailing_space_line !== null) {
-        return 'Leading/Trailing spaces detected: e.g. at line ' + (first_trailing_space_line + 1) + '. Run "Shrink" command to remove them.';
+    if (keyboard_cursor_subscription) {
+        keyboard_cursor_subscription.dispose();
+        keyboard_cursor_subscription = null;
     }
-    return 'OK';
 }
 
 
@@ -448,29 +352,6 @@ function get_active_doc(active_editor=null) {
 }
 
 
-function show_lint_status_bar_button(file_path, language_id) {
-    let lint_cache_key = `${file_path}.${language_id}`;
-    if (!lint_results.has(lint_cache_key))
-        return;
-    var lint_report = lint_results.get(lint_cache_key);
-    if (!lint_status_bar_button)
-        lint_status_bar_button = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
-    lint_status_bar_button.text = 'CSVLint';
-    if (lint_report === 'OK') {
-        lint_status_bar_button.color = '#62f442';
-    } else if (lint_report == 'Processing...') {
-        lint_status_bar_button.color = '#A0A0A0';
-    } else if (lint_report.indexOf('spaces detected') != -1) {
-        lint_status_bar_button.color = '#ffff28';
-    } else {
-        lint_status_bar_button.color = '#f44242';
-    }
-    lint_status_bar_button.tooltip = lint_report + '\nClick to recheck';
-    lint_status_bar_button.command = 'rainbow-csv.CSVLint';
-    lint_status_bar_button.show();
-}
-
-
 function show_align_shrink_button(file_path) {
     if (!align_shrink_button)
         align_shrink_button = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
@@ -487,14 +368,34 @@ function show_align_shrink_button(file_path) {
 }
 
 
-function do_show_column_info_button(status_text) {
+function do_show_column_info_button(full_report, short_report) {
     if (!column_info_button)
         column_info_button = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 1000);
-    const max_len = 25;
-    let short_info = status_text.length > max_len ? status_text.substring(0, max_len - '...'.length + 1) + '...' : status_text;
-    column_info_button.text = short_info;
-    column_info_button.tooltip = status_text;
+    column_info_button.text = short_report;
+    column_info_button.tooltip = full_report;
     column_info_button.show();
+}
+
+
+function make_hover(document, language_id, position, cancellation_token) {
+    if (!get_from_config('enable_tooltip', false)) {
+        return;
+    }
+    let [delim, policy, comment_prefix] = get_dialect(document);
+    let cursor_position_info = ll_rainbow_utils().get_cursor_position_info(vscode, document, delim, policy, comment_prefix, position);
+    if (!cursor_position_info || cancellation_token.isCancellationRequested)
+        return null;
+    let enable_tooltip_column_names = get_from_config('enable_tooltip_column_names', false);
+    let header = get_header(document, delim, policy, comment_prefix);
+    let [_full_text, short_report] = ll_rainbow_utils().format_cursor_position_info(cursor_position_info, header, enable_tooltip_column_names, /*show_comments=*/true, /*max_label_length=*/25);
+    let mds = null;
+    if (language_id == DYNAMIC_CSV) {
+        mds = short_report; // Do not colorize hover text because dynamic csv provides inconsistent colors for some of the tokens.
+    } else {
+        mds = new vscode.MarkdownString();
+        mds.appendCodeblock(short_report, 'rainbow hover markup');
+    }
+    return new vscode.Hover(mds);
 }
 
 
@@ -514,13 +415,15 @@ function show_column_info_button() {
         // Do not report CSV columns for selections.
         return false;
     }
-    let enable_tooltip_column_names = get_from_config('enable_tooltip_column_names', false);
     let active_doc = get_active_doc(active_editor);
-    let language_id = active_doc.languageId;
-    let status_text = make_status_info(active_doc, position, language_id, enable_tooltip_column_names);
-    if (!status_text)
+    let [delim, policy, comment_prefix] = get_dialect(active_doc);
+    let cursor_position_info = ll_rainbow_utils().get_cursor_position_info(vscode, active_doc, delim, policy, comment_prefix, position);
+    if (!cursor_position_info)
         return false;
-    do_show_column_info_button(status_text);
+    let enable_tooltip_column_names = get_from_config('enable_tooltip_column_names', false);
+    let header = get_header(active_doc, delim, policy, comment_prefix);
+    let [full_report, short_report] = ll_rainbow_utils().format_cursor_position_info(cursor_position_info, header, enable_tooltip_column_names, /*show_comments=*/false, /*max_label_length=*/25);
+    do_show_column_info_button(full_report, short_report);
     return true;
 }
 
@@ -545,21 +448,8 @@ function show_rbql_status_bar_button() {
 }
 
 
-function hide_status_bar_buttons() {
-    let all_buttons = [lint_status_bar_button, rbql_status_bar_button, rainbow_off_status_bar_button, copy_back_button, align_shrink_button, column_info_button];
-    for (let i = 0; i < all_buttons.length; i++) {
-        if (all_buttons[i])
-            all_buttons[i].hide();
-    }
-    if (keyboard_cursor_subscription) {
-        keyboard_cursor_subscription.dispose();
-        keyboard_cursor_subscription = null;
-    }
-}
-
-
 function show_rbql_copy_to_source_button(file_path) {
-    let parent_table_path = result_set_parent_map.get(file_path.toLowerCase());
+    let parent_table_path = result_set_parent_map.get(safe_lower(file_path));
     if (!parent_table_path || parent_table_path.indexOf(scratch_buf_marker) != -1)
         return;
     let parent_basename = path.basename(parent_table_path);
@@ -572,7 +462,7 @@ function show_rbql_copy_to_source_button(file_path) {
 }
 
 
-function csv_lint(active_doc, is_manual_op) {
+async function csv_lint(active_doc, is_manual_op) {
     if (!active_doc)
         active_doc = get_active_doc();
     if (!active_doc)
@@ -585,27 +475,34 @@ function csv_lint(active_doc, is_manual_op) {
         return null;
     let lint_cache_key = `${file_path}.${language_id}`;
     if (!is_manual_op) {
-        if (lint_results.has(lint_cache_key))
+        if (extension_context.lint_results.has(lint_cache_key))
             return null;
         if (!get_from_config('enable_auto_csv_lint', false))
             return null;
     }
-    lint_results.set(lint_cache_key, 'Processing...');
-    refresh_status_bar_items(active_doc); // Visual feedback.
-    let [delim, policy] = dialect_map[language_id];
-    var lint_report = produce_lint_report(active_doc, delim, policy);
-    lint_results.set(lint_cache_key, lint_report);
-    return lint_report;
+    let [delim, policy, comment_prefix] = get_dialect(active_doc);
+    if (policy === null)
+        return null;
+    extension_context.lint_results.set(lint_cache_key, {is_processing: true});
+    ll_rainbow_utils().show_lint_status_bar_button(vscode, extension_context, file_path, language_id); // Visual feedback.
+    let detect_trailing_spaces = get_from_config('csv_lint_detect_trailing_spaces', false);
+    let [_records, _num_records_parsed, fields_info, first_defective_line, first_trailing_space_line] = fast_load_utils.parse_document_records(active_doc, delim, policy, comment_prefix, /*stop_on_warning=*/true, /*max_records_to_parse=*/-1, /*collect_records=*/false, detect_trailing_spaces);
+    let is_ok = (first_defective_line === null && fields_info.size <= 1);
+    let lint_result = {'is_ok': is_ok, 'first_defective_line': first_defective_line, 'fields_info': fields_info, 'first_trailing_space_line': first_trailing_space_line};
+    extension_context.lint_results.set(lint_cache_key, lint_result);
+    if (is_manual_op) {
+        // Need timeout here to give user enough time to notice green -> yellow -> green switch, this is a sort of visual feedback.
+        await sleep(500);
+    }
+    ll_rainbow_utils().show_lint_status_bar_button(vscode, extension_context, file_path, language_id); // Visual feedback.
+    return lint_result;
 }
 
 
 async function csv_lint_cmd() {
     // TODO re-run on each file save with content change.
-    let lint_report = csv_lint(null, true);
-    // Need timeout here to give user enough time to notice green -> yellow -> green switch, this is a sort of visual feedback.
-    await sleep(500);
-    refresh_status_bar_items();
-    return lint_report;
+    let lint_report_for_unit_tests = await csv_lint(null, true);
+    return lint_report_for_unit_tests;
 }
 
 
@@ -640,20 +537,17 @@ async function show_warnings(warnings) {
 }
 
 
-async function handle_rbql_result_file(text_doc, warnings) {
-    var out_delim = rbql_context.output_delim;
-    let language_id = map_separator_to_language_id(out_delim);
-    var active_window = vscode.window;
-    if (!active_window)
-        return;
+async function handle_rbql_result_file(text_doc, delim, policy, warnings) {
+    // Settin dialect just in case.
+    extension_context.custom_document_dialects.set(text_doc.fileName, {delim: delim, policy: policy});
+    let language_id = map_dialect_to_language_id(delim, policy);
     try {
-        await active_window.showTextDocument(text_doc);
+        await vscode.window.showTextDocument(text_doc);
     } catch (error) {
         show_single_line_error('Unable to open RBQL result document');
         return;
     }
     if (language_id && text_doc.language_id != language_id) {
-        console.log('changing RBQL result language ' + text_doc.language_id + ' -> ' + language_id);
         await vscode.languages.setTextDocumentLanguage(text_doc, language_id);
     }
     await show_warnings(warnings);
@@ -686,7 +580,7 @@ function run_command(cmd, args, close_and_error_guard, callback_func) {
 }
 
 
-async function handle_command_result(src_table_path, dst_table_path, error_code, stdout, stderr, webview_report_handler) {
+async function handle_command_result(src_table_path, dst_table_path, dst_delim, dst_policy, error_code, stdout, stderr, webview_report_handler) {
     let json_report = stdout;
     let error_type = null;
     let error_msg = null;
@@ -713,10 +607,10 @@ async function handle_command_result(src_table_path, dst_table_path, error_code,
         return; // Just exit: error would be shown in the preview window.
     }
     // No need to close the RBQL console here, better to leave it open so it can be used to quickly adjust the query if needed.
-    autodetection_stoplist.add(dst_table_path);
-    result_set_parent_map.set(dst_table_path.toLowerCase(), src_table_path);
+    extension_context.autodetection_stoplist.add(dst_table_path);
+    result_set_parent_map.set(safe_lower(dst_table_path), src_table_path);
     let doc = await vscode.workspace.openTextDocument(dst_table_path);
-    await handle_rbql_result_file(doc, warnings);
+    await handle_rbql_result_file(doc, dst_delim, dst_policy, warnings);
 }
 
 
@@ -755,21 +649,20 @@ function get_dst_table_dir(input_table_path) {
 }
 
 
-async function run_rbql_query(input_path, csv_encoding, backend_language, rbql_query, output_dialect, enable_rfc_newlines, with_headers, webview_report_handler) {
+async function run_rbql_query(input_path, csv_encoding, backend_language, rbql_query, output_dialect, with_headers, webview_report_handler) {
     last_rbql_queries.set(file_path_to_query_key(input_path), rbql_query);
     var cmd = 'python';
     const test_marker = 'test ';
     let close_and_error_guard = {'process_reported': false};
 
-    let [input_delim, input_policy] = [rbql_context.delim, rbql_context.policy];
-    if (input_policy == 'quoted' && enable_rfc_newlines)
-        input_policy = 'quoted_rfc';
+    let [input_delim, input_policy, comment_prefix] = [rbql_context.delim, rbql_context.policy, rbql_context.comment_prefix];
     let [output_delim, output_policy] = [input_delim, input_policy];
     if (output_dialect == 'csv')
-        [output_delim, output_policy] = [',', 'quoted']; // XXX should it be "quoted_rfc" instead?
+        [output_delim, output_policy] = [',', QUOTED_POLICY];
     if (output_dialect == 'tsv')
-        [output_delim, output_policy] = ['\t', 'simple'];
+        [output_delim, output_policy] = ['\t', SIMPLE_POLICY];
     rbql_context.output_delim = output_delim;
+    rbql_context.output_policy = output_policy;
 
     let output_path = is_web_ext ? null : path.join(get_dst_table_dir(input_path), get_dst_table_name(input_path, output_delim));
 
@@ -778,7 +671,7 @@ async function run_rbql_query(input_path, csv_encoding, backend_language, rbql_q
             cmd = 'nopython';
         }
         let args = [absolute_path_map['rbql mock/rbql_mock.py'], rbql_query];
-        run_command(cmd, args, close_and_error_guard, function(error_code, stdout, stderr) { handle_command_result(input_path, output_path, error_code, stdout, stderr, webview_report_handler); });
+        run_command(cmd, args, close_and_error_guard, function(error_code, stdout, stderr) { handle_command_result(input_path, output_path, output_delim, output_policy, error_code, stdout, stderr, webview_report_handler); });
         return;
     }
     if (backend_language == 'js') {
@@ -786,14 +679,14 @@ async function run_rbql_query(input_path, csv_encoding, backend_language, rbql_q
         let result_doc = null;
         try {
             if (is_web_ext) {
-                let result_lines = await ll_rainbow_utils().rbql_query_web(rbql_query, rbql_context.input_document, input_delim, input_policy, output_delim, output_policy, warnings, with_headers, null);
-                let output_doc_cfg = {content: result_lines.join('\n'), language: map_separator_to_language_id(output_delim)};
+                let result_lines = await ll_rainbow_utils().rbql_query_web(rbql_query, rbql_context.input_document, input_delim, input_policy, output_delim, output_policy, warnings, with_headers, comment_prefix);
+                let output_doc_cfg = {content: result_lines.join('\n'), language: map_dialect_to_language_id(output_delim, output_policy)};
                 result_doc = await vscode.workspace.openTextDocument(output_doc_cfg);
             } else {
                 let csv_options = {'bulk_read': true};
-                await ll_rainbow_utils().rbql_query_node(global_state, rbql_query, input_path, input_delim, input_policy, output_path, output_delim, output_policy, csv_encoding, warnings, with_headers, null, '', csv_options);
-                result_set_parent_map.set(output_path.toLowerCase(), input_path);
-                autodetection_stoplist.add(output_path);
+                await ll_rainbow_utils().rbql_query_node(global_state, rbql_query, input_path, input_delim, input_policy, output_path, output_delim, output_policy, csv_encoding, warnings, with_headers, comment_prefix, /*user_init_code=*/'', csv_options);
+                result_set_parent_map.set(safe_lower(output_path), input_path);
+                extension_context.autodetection_stoplist.add(output_path);
                 result_doc = await vscode.workspace.openTextDocument(output_path);
             }
         } catch (e) {
@@ -802,26 +695,21 @@ async function run_rbql_query(input_path, csv_encoding, backend_language, rbql_q
             return;
         }
         webview_report_handler(null, null);
-        await handle_rbql_result_file(result_doc, warnings);
+        await handle_rbql_result_file(result_doc, output_delim, output_policy, warnings);
     } else {
         if (is_web_ext) {
             webview_report_handler('Input error', 'Python backend for RBQL is not supported in web version, please use JavaScript backend.');
             return;
         }
         let cmd_safe_query = Buffer.from(rbql_query, "utf-8").toString("base64");
-        let args = [absolute_path_map['rbql_core/vscode_rbql.py'], cmd_safe_query, input_path, input_delim, input_policy, output_path, output_delim, output_policy, csv_encoding];
+        if (!comment_prefix) {
+            comment_prefix = '';
+        }
+        let args = [absolute_path_map['rbql_core/vscode_rbql.py'], cmd_safe_query, input_path, input_delim, input_policy, output_path, output_delim, output_policy, comment_prefix, csv_encoding];
         if (with_headers)
             args.push('--with_headers');
-        run_command(cmd, args, close_and_error_guard, function(error_code, stdout, stderr) { handle_command_result(input_path, output_path, error_code, stdout, stderr, webview_report_handler); });
+        run_command(cmd, args, close_and_error_guard, function(error_code, stdout, stderr) { handle_command_result(input_path, output_path, output_delim, output_policy, error_code, stdout, stderr, webview_report_handler); });
     }
-}
-
-
-function get_dialect(document) {
-    var language_id = document.languageId;
-    if (!dialect_map.hasOwnProperty(language_id))
-        return ['monocolumn', 'monocolumn'];
-    return dialect_map[language_id];
 }
 
 
@@ -833,10 +721,8 @@ async function set_header_line() {
     if (!active_doc)
         return;
 
-    var dialect = get_dialect(active_doc);
-    var delim = dialect[0];
-    var policy = dialect[1];
-    if (policy == 'monocolumn') {
+    let [delim, policy, _comment_prefix] = get_dialect(active_doc);
+    if (policy === null) {
         show_single_line_error('Unable to set header line: no separator specified');
         return;
     }
@@ -853,46 +739,80 @@ async function set_header_line() {
 }
 
 
-async function set_rainbow_separator() {
+async function set_rainbow_separator(policy=null) {
     let active_editor = get_active_editor();
     if (!active_editor)
         return;
     var active_doc = get_active_doc(active_editor);
     if (!active_doc)
         return;
-    let original_language_id = active_doc.languageId;
     let selection = active_editor.selection;
     if (!selection) {
         show_single_line_error("Selection is empty");
         return;
     }
-    if (selection.start.line != selection.end.line || selection.start.character + 1 != selection.end.character) {
-        show_single_line_error("Selection must contain exactly one separator character");
+    if (selection.start.line != selection.end.line) {
+        show_single_line_error("Rainbow separator must not span multiple lines");
         return;
     }
-    let separator = active_doc.lineAt(selection.start.line).text.charAt(selection.start.character);
-    let language_id = map_separator_to_language_id(separator);
-    if (!language_id) {
-        show_single_line_error("Selected separator is not supported");
+    let separator = active_doc.lineAt(selection.start.line).text.substring(selection.start.character, selection.end.character);
+    if (policy == QUOTED_RFC_POLICY && separator != ',' && separator != ';') {
+        show_single_line_error("Only comma and semicolon separators are currently supported to use with multiline fields.");
         return;
     }
-
+    if (policy === null) {
+        policy = get_default_policy(separator);
+    }
+    let language_id = map_dialect_to_language_id(separator, policy);
+    extension_context.custom_document_dialects.set(active_doc.fileName, {delim: separator, policy: policy});
+    let original_language_id = active_doc.languageId;
     let doc = await vscode.languages.setTextDocumentLanguage(active_doc, language_id);
-    original_language_ids.set(doc.fileName, original_language_id);
-    csv_lint(doc, false);
-    refresh_status_bar_items(doc);
+    extension_context.original_language_ids.set(doc.fileName, original_language_id);
 }
 
+
+async function set_comment_prefix() {
+    let active_editor = get_active_editor();
+    if (!active_editor)
+        return;
+    var active_doc = get_active_doc(active_editor);
+    if (!active_doc)
+        return;
+    let selection = active_editor.selection;
+    if (!selection) {
+        show_single_line_error("Selection is empty");
+        return;
+    }
+    let comment_prefix = active_doc.lineAt(selection.start.line).text.substring(selection.start.character, selection.end.character);
+    let dialect_info = new Object();
+    if (extension_context.custom_document_dialects.has(active_doc.fileName)) {
+        dialect_info = extension_context.custom_document_dialects.get(active_doc.fileName);
+    }
+    dialect_info['comment_prefix'] = comment_prefix;
+    extension_context.custom_document_dialects.set(active_doc.fileName, dialect_info);
+    if (!comment_prefix) {
+        manual_comment_prefix_stoplist.add(active_doc.fileName);
+    } else {
+        manual_comment_prefix_stoplist.delete(active_doc.fileName);
+    }
+    if (active_doc.languageId == DYNAMIC_CSV) {
+        // Re-enable tokenization to explicitly trigger the highligthing. Sometimes this doesn't happen automatically.
+        enable_dynamic_semantic_tokenization();
+    } else {
+        // Re-enable comment tokenization to explicitly adjust the comment highligthing (sometimes to disable it if comment prefix is set to an empty string).
+        enable_comment_tokenization();
+    }
+}
 
 async function restore_original_language() {
     var active_doc = get_active_doc();
     if (!active_doc)
         return;
     let file_path = active_doc.fileName;
-    autodetection_stoplist.add(file_path);
+    extension_context.autodetection_stoplist.add(file_path);
     let original_language_id = 'plaintext';
-    if (original_language_ids.has(file_path)) {
-        original_language_id = original_language_ids.get(file_path);
+    if (extension_context.original_language_ids.has(file_path)) {
+        original_language_id = extension_context.original_language_ids.get(file_path);
     }
     if (!original_language_id || original_language_id == active_doc.languageId) {
         show_single_line_error("Unable to restore original language");
@@ -900,8 +820,8 @@ async function restore_original_language() {
     }
 
     let doc = await vscode.languages.setTextDocumentLanguage(active_doc, original_language_id);
-    original_language_ids.delete(file_path);
-    refresh_status_bar_items(doc);
+    extension_context.original_language_ids.delete(file_path);
+    disable_rainbow_features_if_non_csv(doc);
 }
 
 
@@ -923,25 +843,23 @@ async function set_join_table_name() {
     let table_name = await vscode.window.showInputBox(input_box_props);
     if (!table_name)
         return; // User pressed Esc and closed the input box.
-    save_to_global_state(ll_rainbow_utils().make_table_name_key(table_name), file_path);
+    await save_to_global_state(ll_rainbow_utils().make_table_name_key(table_name), file_path);
 }
 
 
 async function set_virtual_header() {
     var active_doc = get_active_doc();
-    var dialect = get_dialect(active_doc);
-    var delim = dialect[0];
-    var policy = dialect[1];
+    let [delim, policy, comment_prefix] = get_dialect(active_doc);
+    if (policy === null) {
+        show_single_line_error('Unable to set virtual header: no separator specified');
+        return;
+    }
     var file_path = active_doc.fileName;
     if (!file_path) {
         show_single_line_error('Unable to edit column names for non-file documents');
         return;
     }
-    if (policy == 'monocolumn') {
-        show_single_line_error('Unable to set virtual header: no separator specified');
-        return;
-    }
-    var old_header = get_header(active_doc, delim, policy);
+    var old_header = get_header(active_doc, delim, policy, comment_prefix);
     var title = "Adjust column names displayed in hover tooltips. Actual header line and file content won't be affected.";
     var old_header_str = quoted_join(old_header, delim);
     var input_box_props = {"prompt": title, "value": old_header_str};
@@ -960,10 +878,14 @@ async function column_edit(edit_mode) {
     let active_doc = active_editor.document;
     if (!active_doc)
         return;
-    let dialect = get_dialect(active_doc);
-    let delim = dialect[0];
-    let policy = dialect[1];
-    let comment_prefix = get_from_config('comment_prefix', '');
+    let [delim, policy, comment_prefix] = get_dialect(active_doc);
+    if (policy === null) {
+        return;
+    }
+    if (policy == QUOTED_RFC_POLICY) {
+        show_single_line_error('Column edit mode is not supported for rfc-compatible (multiline fields) dialects.');
+        return;
+    }
 
     let position = active_editor.selection.active;
     let lnum = position.line;
@@ -974,7 +896,7 @@ async function column_edit(edit_mode) {
 
     let entries = report[0];
     let quoting_warning = report[1];
-    let col_num = get_field_by_line_position(entries, cnum + 1);
+    let col_num = ll_rainbow_utils().get_field_by_line_position(entries, delim.length, cnum + 1);
 
     let selections = [];
     let num_lines = active_doc.lineCount;
@@ -995,13 +917,13 @@ async function column_edit(edit_mode) {
             show_single_line_error(`Line ${lnum + 1} doesn't have field number ${col_num + 1}`);
             return;
         }
-        let char_pos_before = entries.slice(0, col_num).join('').length + col_num;
-        let char_pos_after = entries.slice(0, col_num + 1).join('').length + col_num;
-        if (edit_mode == 'ce_before' && policy == 'quoted' && line_text.substring(char_pos_before - 2, char_pos_before + 2).indexOf('"') != -1) {
+        let char_pos_before = entries.slice(0, col_num).join('').length + col_num * delim.length;
+        let char_pos_after = entries.slice(0, col_num + 1).join('').length + col_num * delim.length;
+        if (edit_mode == 'ce_before' && policy == QUOTED_POLICY && line_text.substring(char_pos_before - 2, char_pos_before + 2).indexOf('"') != -1) {
             show_single_line_error(`Accidental data corruption prevention: Cursor at line ${lnum + 1} will not be set: a double quote is in proximity.`);
             return;
         }
-        if (edit_mode == 'ce_after' && policy == 'quoted' && line_text.substring(char_pos_after - 2, char_pos_after + 2).indexOf('"') != -1) {
+        if (edit_mode == 'ce_after' && policy == QUOTED_POLICY && line_text.substring(char_pos_after - 2, char_pos_after + 2).indexOf('"') != -1) {
             show_single_line_error(`Accidental data corruption prevention: Cursor at line ${lnum + 1} will not be set: a double quote is in proximity.`);
             return;
         }
@@ -1038,8 +960,14 @@ async function shrink_table() {
     let language_id = active_doc.languageId;
     if (!dialect_map.hasOwnProperty(language_id))
         return;
-    let [delim, policy] = dialect_map[language_id];
-    let comment_prefix = get_from_config('comment_prefix', '');
+    let [delim, policy, comment_prefix] = get_dialect(active_doc);
+    if (policy === null) {
+        return;
+    }
+    if (policy == QUOTED_RFC_POLICY) {
+        show_single_line_error('Shrinking is not yet supported for files with multiline fields');
+        return;
+    }
     let progress_options = {location: vscode.ProgressLocation.Window, title: 'Rainbow CSV'};
     await vscode.window.withProgress(progress_options, async (progress) => {
         progress.report({message: 'Preparing'});
@@ -1050,7 +978,7 @@ async function shrink_table() {
             return;
         }
         aligned_files.delete(active_doc.fileName);
-        refresh_status_bar_items(active_doc);
+        show_align_shrink_button(active_doc.fileName);
         if (shrinked_doc_text === null) {
             vscode.window.showWarningMessage('No trailing whitespaces found, skipping');
             return;
@@ -1070,8 +998,14 @@ async function align_table() {
     let language_id = active_doc.languageId;
     if (!dialect_map.hasOwnProperty(language_id))
         return;
-    let [delim, policy] = dialect_map[language_id];
-    let comment_prefix = get_from_config('comment_prefix', '');
+    let [delim, policy, comment_prefix] = get_dialect(active_doc);
+    if (policy === null) {
+        return;
+    }
+    if (policy == QUOTED_RFC_POLICY) {
+        show_single_line_error('Alignment is not yet supported for files with multiline fields');
+        return;
+    }
     let progress_options = {location: vscode.ProgressLocation.Window, title: 'Rainbow CSV'};
     await vscode.window.withProgress(progress_options, async (progress) => {
         progress.report({message: 'Calculating column statistics'});
@@ -1090,7 +1024,7 @@ async function align_table() {
         await push_current_stack_to_js_callback_queue_to_allow_ui_update();
         let aligned_doc_text = ll_rainbow_utils().align_columns(active_doc, delim, policy, comment_prefix, column_stats);
         aligned_files.add(active_doc.fileName);
-        refresh_status_bar_items(active_doc);
+        show_align_shrink_button(active_doc.fileName);
         if (aligned_doc_text === null) {
             vscode.window.showWarningMessage('Table is already aligned, skipping');
             return;
@@ -1121,7 +1055,7 @@ async function copy_back() {
     if (!result_doc)
         return;
     let file_path = result_doc.fileName;
-    let parent_table_path = result_set_parent_map.get(file_path.toLowerCase());
+    let parent_table_path = result_set_parent_map.get(safe_lower(file_path));
     if (!parent_table_path)
         return;
     let parent_doc = await vscode.workspace.openTextDocument(parent_table_path);
@@ -1160,14 +1094,13 @@ async function handle_rbql_client_message(webview, message, integration_test_opt
         var backend_language = get_from_global_state('rbql_backend_language', 'js');
         var encoding = get_from_global_state('rbql_encoding', 'utf-8');
         var init_msg = {'msg_type': 'handshake', 'backend_language': backend_language, 'encoding': encoding};
-        sample_preview_records_from_context(rbql_context, init_msg);
+        ll_rainbow_utils().sample_preview_records_from_context(rbql_context, init_msg, preview_window_size, cached_table_parse_result);
         let path_key = file_path_to_query_key(rbql_context.input_document_path);
         if (last_rbql_queries.has(path_key))
             init_msg['last_query'] = last_rbql_queries.get(path_key);
         let history_list = get_from_global_state('rbql_query_history', []);
         init_msg['query_history'] = history_list;
         init_msg['policy'] = rbql_context.policy;
-        init_msg['enable_rfc_newlines'] = rbql_context.enable_rfc_newlines;
         init_msg['with_headers'] = rbql_context.with_headers;
         init_msg['header'] = rbql_context.header;
         init_msg['is_web_ext'] = is_web_ext;
@@ -1175,7 +1108,7 @@ async function handle_rbql_client_message(webview, message, integration_test_opt
             init_msg['integration_test_language'] = integration_test_options.rbql_backend;
             init_msg['integration_test_query'] = integration_test_options.rbql_query;
             init_msg['integration_test_with_headers'] = integration_test_options.with_headers || false;
-            init_msg['integration_test_enable_rfc_newlines'] = integration_test_options.enable_rfc_newlines || false;
+            init_msg['integration_test_delay'] = integration_test_options.integration_test_delay || 2000;
         }
         await webview.postMessage(init_msg);
     }
@@ -1207,15 +1140,6 @@ async function handle_rbql_client_message(webview, message, integration_test_opt
             last_rbql_queries.set(file_path_to_query_key(rbql_context.input_document_path), rbql_query);
     }
 
-    if (message_type == 'newlines_policy_change') {
-        rbql_context.enable_rfc_newlines = message['enable_rfc_newlines'];
-        if (rbql_context.input_document_path)
-            await save_to_global_state(make_rfc_policy_key(rbql_context.input_document_path), rbql_context.enable_rfc_newlines);
-        let protocol_message = {'msg_type': 'resample'};
-        sample_preview_records_from_context(rbql_context, protocol_message);
-        await webview.postMessage(protocol_message);
-    }
-
     if (message_type == 'with_headers_change') {
         rbql_context.with_headers = message['with_headers'];
         if (rbql_context.input_document_path)
@@ -1234,7 +1158,7 @@ async function handle_rbql_client_message(webview, message, integration_test_opt
             rbql_context.requested_start_record = rbql_context.input_document.lineCount; // This is just max possible value which is incorrect and will be adjusted later.
         }
         let protocol_message = {'msg_type': 'navigate'};
-        sample_preview_records_from_context(rbql_context, protocol_message);
+        ll_rainbow_utils().sample_preview_records_from_context(rbql_context, protocol_message, preview_window_size, cached_table_parse_result);
         await webview.postMessage(protocol_message);
     }
 
@@ -1243,10 +1167,9 @@ async function handle_rbql_client_message(webview, message, integration_test_opt
         let backend_language = message['backend_language'];
         let encoding = message['encoding'];
         let output_dialect = message['output_dialect'];
-        let enable_rfc_newlines = message['enable_rfc_newlines'];
         let with_headers = message['with_headers'];
         await update_query_history(rbql_query);
-        await run_rbql_query(rbql_context.input_document_path, encoding, backend_language, rbql_query, output_dialect, enable_rfc_newlines, with_headers, webview_report_handler);
+        await run_rbql_query(rbql_context.input_document_path, encoding, backend_language, rbql_query, output_dialect, with_headers, webview_report_handler);
     }
 
     if (message_type == 'edit_udf') {
@@ -1327,24 +1250,22 @@ async function edit_rbql(integration_test_options=null) {
         show_single_line_error("Unable to run RBQL for this file");
         return;
     }
-    let language_id = active_doc.languageId;
-    let delim = 'monocolumn';
-    let policy = 'monocolumn';
-    if (dialect_map.hasOwnProperty(language_id)) {
-        [delim, policy] = dialect_map[language_id];
+
+    let [delim, policy, comment_prefix] = get_dialect(active_doc);
+    if (policy === null) {
+        policy = 'monocolumn';
+        delim = 'monocolumn';
     }
-    let enable_rfc_newlines = get_from_global_state(make_rfc_policy_key(input_path), false);
     let with_headers_by_default = get_from_config('rbql_with_headers_by_default', false);
     let with_headers = get_from_global_state(make_with_headers_key(input_path), with_headers_by_default);
-    let header = get_header_from_document(active_doc, delim, policy);
+    let header = get_header_from_document(active_doc, delim, policy, comment_prefix);
     rbql_context = {
         "input_document": active_doc,
         "input_document_path": input_path,
         "requested_start_record": 0,
         "delim": delim,
         "policy": policy,
-        "rfc_record_map": [],
-        "enable_rfc_newlines": enable_rfc_newlines,
+        "comment_prefix": comment_prefix,
         "with_headers": with_headers,
         "header": header
     };
@@ -1364,149 +1285,139 @@ async function edit_rbql(integration_test_options=null) {
 }
 
 
-function get_num_columns_if_delimited(active_doc, delim, policy, min_num_columns, min_num_lines) {
-    var num_lines = active_doc.lineCount;
-    let num_fields = 0;
-    let num_lines_checked = 0;
-    let comment_prefix_for_autodetection = get_from_config('comment_prefix', '');
-    if (!comment_prefix_for_autodetection)
-        comment_prefix_for_autodetection = '#';
-    for (var lnum = 0; lnum < num_lines; lnum++) {
-        var line_text = active_doc.lineAt(lnum).text;
-        if (lnum + 1 == num_lines && !line_text)
-            break;
-        if (line_text.startsWith(comment_prefix_for_autodetection))
+function autodetect_dialect(config, active_doc, candidate_separators, comment_prefix) {
+    let candidate_dialects = [];
+    for (let separator of candidate_separators) {
+        let policy = get_default_policy(separator);
+        let dialect_id = map_dialect_to_language_id(separator, policy);
+        if (!dialect_id || !policy)
             continue;
-        let [fields, warning] = csv_utils.smart_split(line_text, delim, policy, true);
-        if (warning)
-            return 0; // TODO don't fail on warnings?
-        if (!num_fields)
-            num_fields = fields.length;
-        if (num_fields < min_num_columns || num_fields != fields.length)
-            return 0;
-        num_lines_checked += 1;
-    }
-    return num_lines_checked >= min_num_lines ? num_fields : 0;
-}
-
-
-function autodetect_dialect(active_doc, candidate_separators) {
-    let min_num_lines = get_from_config('autodetection_min_line_count', 10);
-    if (active_doc.lineCount < min_num_lines)
-        return null;
-
-    let best_dialect = null;
-    let best_dialect_num_columns = 1;
-    for (let i = 0; i < candidate_separators.length; i++) {
-        let dialect_id = map_separator_to_language_id(candidate_separators[i]);
-        if (!dialect_id)
-            continue;
-        let [delim, policy] = dialect_map[dialect_id];
-        let cur_dialect_num_columns = get_num_columns_if_delimited(active_doc, delim, policy, best_dialect_num_columns + 1, min_num_lines);
-        if (cur_dialect_num_columns > best_dialect_num_columns) {
-            best_dialect_num_columns = cur_dialect_num_columns;
-            best_dialect = dialect_id;
+        candidate_dialects.push([dialect_id, separator, policy]);
+        if (separator == ',' || separator == ';') {
+            candidate_dialects.push([DYNAMIC_CSV, separator, QUOTED_RFC_POLICY]);
         }
     }
-    return best_dialect;
+    let detect_trailing_spaces = get_from_config('csv_lint_detect_trailing_spaces', false, config);
+    let min_num_lines = get_from_config('autodetection_min_line_count', 10, config);
+    if (active_doc.lineCount < min_num_lines)
+        return [null, null, null];
+    let [best_dialect, best_separator, best_policy, best_dialect_first_trailing_space_line] = [null, null, null, null];
+    let best_dialect_num_columns = 1;
+    for (let candidate_dialect of candidate_dialects) {
+        let [dialect_id, separator, policy] = candidate_dialect;
+        let [_records, num_records_parsed, fields_info, first_defective_line, first_trailing_space_line] = fast_load_utils.parse_document_records(active_doc, separator, policy, comment_prefix, /*stop_on_warning=*/true, /*max_records_to_parse=*/-1, /*collect_records=*/false, detect_trailing_spaces, /*min_num_fields_for_autodetection=*/best_dialect_num_columns + 1);
+        if (first_defective_line !== null || fields_info.size != 1)
+            continue;
+        if (num_records_parsed < min_num_lines) {
+            // Ensure that min_num_lines also applies to number of parsed records. There could be a discrepancy between number of lines and records due to comment lines and/or multiline rfc records.
+            continue;
+        }
+        let num_columns = Array.from(fields_info.keys())[0];
+        if (num_columns >= best_dialect_num_columns + 1) {
+            best_dialect_num_columns = num_columns;
+            [best_dialect, best_separator, best_policy] = [dialect_id, separator, policy];
+            best_dialect_first_trailing_space_line = first_trailing_space_line;
+        }
+    }
+    return [best_dialect, best_separator, best_policy, best_dialect_first_trailing_space_line];
 }
 
 
-function autodetect_dialect_frequency_based(active_doc, candidate_separators) {
-    let best_dialect = 'csv';
+function autodetect_dialect_frequency_based(active_doc, candidate_separators, max_num_chars_to_test) {
+    let [best_dialect, best_separator, best_policy] = ['csv', ',', QUOTED_POLICY];
     let best_dialect_frequency = 0;
     let data = active_doc.getText();
     if (!data)
-        return best_dialect;
-    for (let i = 0; i < candidate_separators.length; i++) {
-        if (candidate_separators[i] == ' ' || candidate_separators[i] == '.')
+        return [best_dialect, best_separator, best_policy];
+    for (let separator of candidate_separators) {
+        if (separator == ' ' || separator == '.')
             continue; // Whitespace and dot have advantage over other separators in this algorithm, so we just skip them.
-        let dialect_id = map_separator_to_language_id(candidate_separators[i]);
         let frequency = 0;
-        for (let j = 0; j < 10000 && j < data.length; j++) {
-            if (data[j] == candidate_separators[i])
+        for (let j = 0; j < max_num_chars_to_test && j < data.length; j++) {
+            if (data[j] == separator)
                 frequency += 1;
         }
         if (frequency > best_dialect_frequency) {
-            best_dialect = dialect_id;
+            let policy = get_default_policy(separator);
+            let dialect_id = map_dialect_to_language_id(separator, policy);
+            [best_dialect, best_separator, best_policy] = [dialect_id, separator, policy];
             best_dialect_frequency = frequency;
         }
     }
-    return best_dialect;
+    return [best_dialect, best_separator, best_policy];
 }
 
 
-async function autoenable_rainbow_csv(active_doc) {
+async function try_autoenable_rainbow_csv(vscode, config, extension_context, active_doc) {
+    // VSCode to some extent is capable of "remembering" doc id in the previous invocation, at least when used in debug mode.
     if (!active_doc)
         return active_doc;
-    if (!get_from_config('enable_separator_autodetection', false))
+    if (!get_from_config('enable_separator_autodetection', false, config))
         return active_doc;
-    let candidate_separators = get_from_config('autodetect_separators', []);
+    let candidate_separators = get_from_config('autodetect_separators', [], config).map((s) => s === 'TAB' ? '\t' : s);
     var original_language_id = active_doc.languageId;
     var file_path = active_doc.fileName;
-    if (!file_path || autodetection_stoplist.has(file_path)) {
+    if (!file_path || extension_context.autodetection_stoplist.has(file_path) || file_path.endsWith('.git')) { // For some reason there are some ghost '.git' files. TODO figure this out!
         return active_doc;
     }
     let is_default_csv = file_path.endsWith('.csv') && original_language_id == 'csv';
     if (original_language_id != 'plaintext' && !is_default_csv)
         return active_doc;
-    let rainbow_csv_language_id = autodetect_dialect(active_doc, candidate_separators);
-    if (!rainbow_csv_language_id && is_default_csv) {
-        // Smart autodetection method has failed, but we need to choose a separator because this is a csv file. Let's just find the most popular one.
-        rainbow_csv_language_id = autodetect_dialect_frequency_based(active_doc, candidate_separators);
+    let comment_prefix_for_autodetection = get_from_config('comment_prefix', '', config) || '#'; // Assume '#' as a comment prefix for autodetection purposes only.
+    let [rainbow_csv_language_id, delim, policy, first_trailing_space_line] = autodetect_dialect(config, active_doc, candidate_separators, comment_prefix_for_autodetection);
+    if (rainbow_csv_language_id) {
+        // Add the file to lint results to avoid re-parsing it with CSV Lint later.
+        extension_context.lint_results.set(`${active_doc.fileName}.${rainbow_csv_language_id}`, {'is_ok': true, 'first_trailing_space_line': first_trailing_space_line});
+    } else if (!rainbow_csv_language_id && is_default_csv) {
+        // Smart autodetection method has failed, but we need to choose a separator because this is a csv file. Let's just find the most popular one within the first N characters.
+        [rainbow_csv_language_id, delim, policy] = autodetect_dialect_frequency_based(active_doc, candidate_separators, /*max_num_chars_to_test=*/10000);
     }
-    if (!rainbow_csv_language_id || rainbow_csv_language_id == original_language_id)
+    if (!rainbow_csv_language_id)
         return active_doc;
-
+    // Intentionally do not store comment prefix used for autodetection in the dialect info since it is not file-specific anyway and is stored in the settings.
+    // And in case if user changes it in the settings it would immediately affect the autodetected files.
+    extension_context.custom_document_dialects.set(active_doc.fileName, {delim: delim, policy: policy});
+    if (rainbow_csv_language_id == original_language_id)
+        return active_doc;
     let doc = await vscode.languages.setTextDocumentLanguage(active_doc, rainbow_csv_language_id);
-    original_language_ids.set(file_path, original_language_id);
+    extension_context.original_language_ids.set(file_path, original_language_id);
     return doc;
 }
 
 
-async function handle_first_empty_doc_edit(change_event) {
+async function handle_first_edit_for_an_empty_doc(change_event) {
     if (!change_event)
         return;
-    if (doc_edit_subscription) {
-        doc_edit_subscription.dispose();
-        doc_edit_subscription = null;
+    if (doc_first_edit_subscription) {
+        doc_first_edit_subscription.dispose();
+        doc_first_edit_subscription = null;
     }
-    let active_doc = change_event.document;
-    if (!active_doc)
-        return;
-    let candidate_separators = get_from_config('autodetect_separators', []);
-    let rainbow_csv_language_id = autodetect_dialect(active_doc, candidate_separators);
-    if (!rainbow_csv_language_id)
-        return;
-    let doc = await vscode.languages.setTextDocumentLanguage(active_doc, rainbow_csv_language_id);
-    csv_lint(doc, false);
-    refresh_status_bar_items(doc);
+    await try_autoenable_rainbow_csv(vscode, vscode.workspace.getConfiguration('rainbow_csv'), extension_context, change_event.document);
 }
 
 
 function register_csv_copy_paste_for_empty_doc(active_doc) {
     if (!get_from_config('enable_separator_autodetection', false))
         return;
-    if (!active_doc || doc_edit_subscription)
+    if (!active_doc || doc_first_edit_subscription)
         return;
     if (!active_doc.isUntitled && active_doc.lineCount != 0)
         return;
-    doc_edit_subscription = vscode.workspace.onDidChangeTextDocument(handle_first_empty_doc_edit);
-    return;
+    doc_first_edit_subscription = vscode.workspace.onDidChangeTextDocument(handle_first_edit_for_an_empty_doc);
 }
 
 
-function handle_editor_switch(editor) {
+async function handle_editor_switch(editor) {
     let active_doc = get_active_doc(editor);
-    csv_lint(active_doc, false);
-    // Calling `refresh_status_bar_items` is required for non-csv documents too to ensure that they have csv-related status items cleared.
-    refresh_status_bar_items(active_doc);
+    disable_rainbow_features_if_non_csv(active_doc);
+    await enable_rainbow_features_if_csv(active_doc); // No-op if non-csv.
 }
 
 
 function do_handle_cursor_movement() {
-    if (!show_column_info_button())
+    if (!show_column_info_button() && column_info_button) {
         column_info_button.hide();
+    }
 }
 
 
@@ -1521,9 +1432,9 @@ function handle_cursor_movement(_unused_cursor_event) {
 
 async function handle_doc_open(active_doc) {
     register_csv_copy_paste_for_empty_doc(active_doc);
-    active_doc = await autoenable_rainbow_csv(active_doc);
-    csv_lint(active_doc, false);
-    refresh_status_bar_items(active_doc);
+    active_doc = await try_autoenable_rainbow_csv(vscode, vscode.workspace.getConfiguration('rainbow_csv'), extension_context, active_doc);
+    disable_rainbow_features_if_non_csv(active_doc);
+    await enable_rainbow_features_if_csv(active_doc); // No-op if non-csv.
 }
 
 
@@ -1598,10 +1509,66 @@ async function make_preview(uri, preview_mode) {
 function register_csv_hover_info_provider(language_id, context) {
     let hover_provider = vscode.languages.registerHoverProvider(language_id, {
         provideHover(document, position, token) {
-            return make_hover(document, position, language_id, token);
+            return make_hover(document, language_id, position, token);
         }
     });
     context.subscriptions.push(hover_provider);
+}
+
+
+class RainbowTokenProvider {
+    // We don't utilize typescript `implement` interface keyword, because TS doesn't seem to be exporting interfaces to JS (unlike classes).
+    constructor() {
+    }
+    async provideDocumentRangeSemanticTokens(document, range, _token) {
+        let [delim, policy, comment_prefix] = get_dialect(document);
+        if (policy === null || (policy !== SIMPLE_POLICY && policy !== QUOTED_RFC_POLICY)) {
+            return null; // Sanity check: currently dynamic tokenization is enabled only for simple and quoted rfc policies.
+        }
+        let table_ranges = ll_rainbow_utils().parse_document_range(vscode, document, delim, policy, comment_prefix, range);
+        // Create a new builder to clear the previous tokens.
+        const builder = new vscode.SemanticTokensBuilder(tokens_legend);
+        for (let row_info of table_ranges) {
+            if (row_info.hasOwnProperty('comment_range')) {
+                builder.push(row_info.comment_range, 'comment');
+            } else {
+                for (let col_num = 0; col_num < row_info.record_ranges.length; col_num++) {
+                    for (let record_range of row_info.record_ranges[col_num]) {
+                        // One logical field can map to multiple tokens if it spans multiple lines because VSCode doesn't support multiline tokens.
+                        builder.push(record_range, tokenTypes[col_num % tokenTypes.length]);
+                    }
+                }
+            }
+        }
+        return builder.build();
+    }
+}
+
+
+class CommentTokenProvider {
+    constructor() {
+    }
+    async provideDocumentRangeSemanticTokens(doc, range, _token) {
+        let [_delim, policy, comment_prefix] = get_dialect(doc);
+        if (manual_comment_prefix_stoplist.has(doc.fileName) && !comment_prefix) {
+            // We can't use empty comment prefix (and early return) - in that case the previous highlighting would not go away due to a VSCode quirk, need to make an empty build instead to make sure that all previously highlighted lines were cleared.
+            comment_prefix = '#####COMMENT_PREFIX_THAT_CAN_NOT_OCCURE_IN_A_NORMAL_FILE_AND_EVEN_IF_IT_OCCURES_NOT_A_BIG_DEAL####';
+        }
+        if (!comment_prefix || policy === null || policy == QUOTED_RFC_POLICY) {
+            return null; // Sanity check: with QUOTED_RFC_POLICY we should be using a different tokenizer which also handles comments.
+        }
+        // Create a new builder to clear the previous tokens.
+        const builder = new vscode.SemanticTokensBuilder(tokens_legend);
+        let begin_line = Math.max(0, range.start.line - dynamic_csv_highlight_margin);
+        let end_line = Math.min(doc.lineCount, range.end.line + dynamic_csv_highlight_margin);
+        for (let lnum = begin_line; lnum < end_line; lnum++) {
+            let line_text = doc.lineAt(lnum).text;
+            if (line_text.startsWith(comment_prefix)) {
+                builder.push(new vscode.Range(lnum, 0, lnum, line_text.length), 'comment');
+            }
+        }
+        return builder.build();
+    }
 }
 
 
@@ -1637,12 +1604,14 @@ async function activate(context) {
     var lint_cmd = vscode.commands.registerCommand('rainbow-csv.CSVLint', csv_lint_cmd);
     var rbql_cmd = vscode.commands.registerCommand('rainbow-csv.RBQL', edit_rbql);
     var set_header_line_cmd = vscode.commands.registerCommand('rainbow-csv.SetHeaderLine', set_header_line);
+    var set_comment_prefix_cmd = vscode.commands.registerCommand('rainbow-csv.SetCommentPrefix', set_comment_prefix);
     var edit_column_names_cmd = vscode.commands.registerCommand('rainbow-csv.SetVirtualHeader', set_virtual_header);
     var set_join_table_name_cmd = vscode.commands.registerCommand('rainbow-csv.SetJoinTableName', set_join_table_name); // WEB_DISABLED
     var column_edit_before_cmd = vscode.commands.registerCommand('rainbow-csv.ColumnEditBefore', async function() { await column_edit('ce_before'); });
     var column_edit_after_cmd = vscode.commands.registerCommand('rainbow-csv.ColumnEditAfter', async function() { await column_edit('ce_after'); });
     var column_edit_select_cmd = vscode.commands.registerCommand('rainbow-csv.ColumnEditSelect', async function() { await column_edit('ce_select'); });
-    var set_separator_cmd = vscode.commands.registerCommand('rainbow-csv.RainbowSeparator', set_rainbow_separator);
+    var set_separator_cmd = vscode.commands.registerCommand('rainbow-csv.RainbowSeparator', () => { set_rainbow_separator(/*policy=*/null); });
+    var set_separator_cmd = vscode.commands.registerCommand('rainbow-csv.RainbowSeparatorMultiline', () => { set_rainbow_separator(QUOTED_RFC_POLICY); });
     var rainbow_off_cmd = vscode.commands.registerCommand('rainbow-csv.RainbowSeparatorOff', restore_original_language);
     var sample_head_cmd = vscode.commands.registerCommand('rainbow-csv.SampleHead', async function(uri) { await make_preview(uri, 'head'); }); // WEB_DISABLED
     var sample_tail_cmd = vscode.commands.registerCommand('rainbow-csv.SampleTail', async function(uri) { await make_preview(uri, 'tail'); }); // WEB_DISABLED
@@ -1653,6 +1622,12 @@ async function activate(context) {
 
     var doc_open_event = vscode.workspace.onDidOpenTextDocument(handle_doc_open);
     var switch_event = vscode.window.onDidChangeActiveTextEditor(handle_editor_switch);
+
+    enable_dynamic_semantic_tokenization();
+
+    if (get_from_config('comment_prefix', null)) {
+        enable_comment_tokenization();
+    }
 
     // The only purpose to add the entries to context.subscriptions is to guarantee their disposal during extension deactivation
     context.subscriptions.push(lint_cmd);
@@ -1672,7 +1647,9 @@ async function activate(context) {
     context.subscriptions.push(shrink_cmd);
     context.subscriptions.push(copy_back_cmd);
     context.subscriptions.push(set_header_line_cmd);
+    context.subscriptions.push(set_comment_prefix_cmd);
     context.subscriptions.push(internal_test_cmd);
+
 
     // Need this because "onDidOpenTextDocument()" doesn't get called for the first open document.
     // Another issue is when dev debug logging mode is enabled, the first document would be "Log" because it is printing something and gets VSCode focus.
@@ -1689,3 +1666,7 @@ function deactivate() {
 
 exports.activate = activate;
 exports.deactivate = deactivate;
+
+// Exports just for unit tests:
+exports.autodetect_dialect_frequency_based = autodetect_dialect_frequency_based;
+exports.try_autoenable_rainbow_csv = try_autoenable_rainbow_csv;

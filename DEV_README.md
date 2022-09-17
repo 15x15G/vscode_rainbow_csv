@@ -1,5 +1,11 @@
 ## Instructions
 
+### Pre-publishing checklist
+* Make sure that hover info shows hover information in different colors corresponding to the column color in classical csv mode.
+* Make sure that comments are highlighted with a separate comment color (this can also be seen in integration tests).
+* Run `npm run lint`
+
+
 ### Debugging the extension:
 #### For standard VSCode:
 1. Open rainbow_csv directory in VSCode  
@@ -23,7 +29,7 @@ The difference between running in win and in WSL is that in WSL it would only ru
 
 #### For web-based VSCode:
 1. run `npm install` (If you have WSL - run in Windows, don't run in WSL).
-2. run `compile-web` (If you have WSL - run in Windows, don't run in WSL). This will combine all scripts into a single web script and put it into the `dist` folder.
+2. run `npm run compile-web` (If you have WSL - run in Windows, don't run in WSL). This will combine all scripts into a single web script and put it into the `dist` folder.
 3. run `npm run test-in-browser` (If you have WSL - run in Windows, don't run in WSL). This will open a new browser windows and run all the unit tests. Make sure that the tests are successful.
 
 
@@ -90,7 +96,8 @@ In order to generate RBQL documentation use showdown - based markdown_to_html.js
 Usage: `node markdown_to_html.js ~/vscode_rainbow_csv/rbql_core/README.md out.html`
 
 
-## TODO LIST
+
+# TODO LIST
 * Improve RBQL encoding handling logic when VScode encoding info API is implemented, see https://github.com/microsoft/vscode/issues/824.
 
 * Consider keeping only one open RBQL console at any time - if another one opens automatically close the previous one.
@@ -101,30 +108,45 @@ Usage: `node markdown_to_html.js ~/vscode_rainbow_csv/rbql_core/README.md out.ht
 
 * Consider replacing the RBQL query text input with scrollable textarea - it has a drawback that on enter it will go to the next line instead running the query.
 
-* Figure out if it is possible to convert to a web extension.
-
-* Make the `is_web_ext` check more reliable and explicit.
-
-* Replace callbacks with async where possible
-
 * Store VSCode documents instead of file paths in result_set_parent_map so that the map can be used in web version. And the autodetection_stoplist also should be doc based to work in web.
 
 * Support JOIN queries in web version.
 
-* Get rid of typescript files and infra, but add comments explaining how you obtained the js versions of the files.
-
-* Try to get rid of `@types/vscode` dev dependency.
-
 * Support all commands in web version
-
-* Use `await save_to_global_state()` everywhere.
-
-* Use `await vscode.workspace.openTextDocument` everywhere.
 
 * Get rid of `then` entirely
 
 * Merge rbql_query_web and rbql_query_node
 
-* Add comment prefix handling in RBQL, unit tests (and web_ui entry?)
-
 * Show column info in statusline even when there are consistency issues, but highlight it in red/yellow
+
+* Add feature to decorate separators with a transparent box or different color or something, see the opened issue.
+
+* Consider speeding up autodetection by adding parse_rfc option. If it is false - we can only parse top N=10 lines and skip setting lint cache key until the actual lint.
+
+* Consider using RFC-like syntax by ajhyndman, see https://github.com/mechatroner/vscode_rainbow_csv/issues/4
+
+* Implement align/shrink for the RFC dialects too.
+
+* Get rid of `csv (dot)` and similar dialects, since we now have dynamic csv to rule them all.
+
+* Update README.md with new commands and info.
+
+
+## RFC Support plan
+We need:
+1. Full doc tokenization (rbql + rbql UI preview sampling + lint + autodetection) - 100% correct, doesn't have to use VSCode ranges.
+2. Fragment tokenization (hover + highlighting) - best effort, fast, should use VSCode ranges.
+
+
+## OTHER
+Token modifiers to use if needed:
+```
+const tokenModifiers = ['rainbow2', 'rainbow3', 'rainbow4', 'rainbow5', 'rainbow6', 'rainbow7', 'rainbow8', 'rainbow9', 'rainbow10', 'name', 'function', 'parameter', 'numeric', 'type', 'bold'];
+const modifier_sequences = [[], ['rainbow2'], ['name', 'function', 'rainbow3'], ['rainbow4'], ['rainbow5'], ['parameter', 'rainbow6'], ['numeric', 'rainbow7'], ['name', 'type', 'rainbow8'], ['bold', 'rainbow9'], 'rainbow10'];
+```
+
+
+#### Maximum supported file size in VSCode
+https://stackoverflow.com/questions/53625687/what-is-the-largest-filesize-supported-by-vs-code-syntax-highlighting
+20MB Or 300K lines (avg 66 chars per line).
