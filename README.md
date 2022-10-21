@@ -33,33 +33,25 @@ Another way to do this: select one separator character with mouse cursor -> righ
 
 #### Supported separators
 
-|Language name    | Separator            | Extension | Properties                          |
-|-----------------|----------------------|-----------|-------------------------------------|
-|csv              | , (comma)            | .csv      | Ignored inside double-quoted fields |
-|tsv              | \t (TAB)             | .tsv .tab |                                     |
-|csv (semicolon)  | ; (semicolon)        |           | Ignored inside double-quoted fields |
-|csv (whitespace) | whitespace           |           | Consecutive whitespaces are merged  |
-|csv (pipe)       | &#124; (pipe)        |           |                                     |
-|csv (...)        | ~ ^ : " = . -        |           |                                     |
-|dynamic csv      | any char or string   |           |                                     |
-
+| Language name    | Separator          | Extension | Properties                          |
+| ---------------- | ------------------ | --------- | ----------------------------------- |
+| csv              | , (comma)          | .csv      | Ignored inside double-quoted fields |
+| tsv              | \t (TAB)           | .tsv .tab |                                     |
+| csv (semicolon)  | ; (semicolon)      |           | Ignored inside double-quoted fields |
+| csv (whitespace) | whitespace         |           | Consecutive whitespaces are merged  |
+| csv (pipe)       | &#124; (pipe)      |           |                                     |
+| csv (...)        | ~ ^ : " = . -      |           |                                     |
+| dynamic csv      | any char or string |           |                                     |
 
 #### Content-based separator autodetection
 
 Rainbow CSV runs table autodetection algorithm for all "Plain Text" and "\*.csv" files. In most cases this is a very cheap operation because autodetection usually stops after checking only 1 or 2 topmost lines.  
 Autodetection can be disabled at the extension settings page.  
-The autodetection algorithm skips files that have less than N=10 non-comment lines; value of N can be adjusted in the settings.  
-By default only comma, tab, semicolon and pipe are tried during autodetection, but you can adjust the list of candidate separators: add the following line to your VSCode config and edit it by removing or including any of the supported separators:
-
-```
-"rainbow_csv.autodetect_separators": ["\t", ",", ";", "|"],
-```
-
-If the autodetection algorithm makes an error and highlights a non-csv file, you can press "Rainbow OFF" button inside the status line.
+By default only comma, tab, semicolon and pipe are tried during autodetection, but you can adjust the list of candidate separators in extension settings.
 
 #### Customizing file extension - separator association
 
-If you often work with spreadsheet files with one specific extension (e.g. ".dat") and you don't want to rely on the autodetection algorithm, you can associate that extension with one of the supported separators.  
+If you often work with csv files with one specific extension (e.g. ".dat") and you don't want to rely on the autodetection algorithm, you can associate that extension with one of the supported separators.  
 For example to associate ".dat" extension with pipe-separated files and ".csv" with semicolon-separated files add the following lines to your VS Code json config:
 
 ```
@@ -70,8 +62,17 @@ For example to associate ".dat" extension with pipe-separated files and ".csv" w
 ```
 
 Important: language identifiers in the config must be specified in **lower case**! E.g. use `csv (semicolon)`, not `CSV (semicolon)`.  
-List of supported language ids: `"csv", "tsv", "csv (semicolon)", "csv (pipe)", "csv (whitespace)", "csv (tilde)", "csv (caret)", "csv (colon)", "csv (double quote)", "csv (equals)", "csv (dot)", "csv (hyphen)"`
+List of supported language ids: `"csv", "tsv", "csv (semicolon)", "csv (pipe)", "csv (whitespace)", "csv (tilde)", "csv (caret)", "csv (colon)", "csv (double quote)", "csv (equals)", "csv (dot)", "csv (hyphen)"`.
 
+#### Working with arbitrary separators
+
+Rainbow CSV allows to use an arbitrary character or string as a separator.
+You can add the separator to the list of autodetected separators in the VSCode settings or if you just want to use it once you can either:
+
+- Select `Dynamic CSV` filetype (bottom right corner) and then enter the separator text in the popup dialog.
+- Select the separator text with cursor and run `Rainbow CSV: Set separator ... ` command.
+
+`Dynamic CSV` filetype also supports multiline CSV fields escaped in double quotes as described in RFC-4180.
 
 #### CSVLint consistency check
 
@@ -110,6 +111,7 @@ There you can find the list of available options and their description.
 Align columns with whitespaces or shrink them (remove leading/trailing whitespaces)
 
 #### Set separator
+
 Set the currently selected text (single character or multiline string) as a separator and re-highlight the file.
 
 #### ColumnEditBefore, ColumnEditAfter, ColumnEditSelect
@@ -129,6 +131,7 @@ Uses the current line to adjust column names displayed in hover tooltips. Actual
 This is a "Virtual" header and will be persistent and will be associated with the parent file across VSCode sessions.
 
 #### RBQL
+
 Enter RBQL - SQL-like language query editing mode.
 
 #### SetJoinTableName
@@ -173,8 +176,7 @@ Screenshot of RBQL Console:
 
 #### Disadvantages:
 
-* Rainbow CSV may be less effective for CSV files with many (> 10) columns and for files with multiline fields, although textual alignment can significantly improve the situation.  
-
+- Rainbow CSV may be less effective for CSV files with many (> 10) columns and for files with multiline fields, although textual alignment can significantly improve the situation.
 
 ### References
 

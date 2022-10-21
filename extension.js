@@ -9,6 +9,7 @@ const fast_load_utils = require('./fast_load_utils.js');
 
 // Please see DEV_README.md file for additional info.
 
+
 const csv_utils = require('./rbql_core/rbql-js/csv_utils.js');
 
 var rbql_csv = null; // Using lazy load to improve startup performance.
@@ -45,6 +46,7 @@ var align_shrink_button = null;
 var rainbow_off_status_bar_button = null;
 var copy_back_button = null;
 var column_info_button = null;
+var dynamic_dialect_select_button = null;
 
 var rbql_context = null;
 
@@ -74,7 +76,17 @@ const WHITESPACE_POLICY = 'whitespace';
 const QUOTED_RFC_POLICY = 'quoted_rfc';
 const SIMPLE_POLICY = 'simple';
 
-let extension_context = {lint_results: new Map(), lint_status_bar_button: null, custom_document_dialects: new Map(), original_language_ids: new Map(), autodetection_stoplist: new Set()};
+
+let extension_context = {
+    lint_results: new Map(),
+    lint_status_bar_button: null,
+    dynamic_document_dialects: new Map(),
+    custom_comment_prefixes: new Map(),
+    original_language_ids: new Map(),
+    autodetection_stoplist: new Set(),
+    autodetection_temporarily_disabled_for_rbql: false,
+    dynamic_dialect_for_next_request: null,
+};
 
 const dialect_map = {
     'csv': [',', QUOTED_POLICY],
@@ -223,28 +235,33 @@ function get_dialect(document) {
     let language_id = document.languageId;
     let delim = null;
     let policy = null;
-    let comment_prefix = get_from_config('comment_prefix', '');
-    if (extension_context.custom_document_dialects.has(document.fileName)) {
-        let dialect_info = extension_context.custom_document_dialects.get(document.fileName);
-        // This check allows to override default comment_prefix with an empty string from user selection to disable comment prefix in selected files.
-        if (dialect_info.hasOwnProperty('comment_prefix') && dialect_info.comment_prefix !== null) {
-            comment_prefix = dialect_info.comment_prefix;
-        }
-        delim = dialect_info.delim;
-        policy = dialect_info.policy;
+
+    let comment_prefix = '';
+    if (extension_context.custom_comment_prefixes.has(document.fileName)) {
+        comment_prefix = extension_context.custom_comment_prefixes.get(document.fileName);
+    } else {
+        comment_prefix = get_from_config('comment_prefix', '');
     }
-    if (language_id == DYNAMIC_CSV) {
+    if (language_id != DYNAMIC_CSV && dialect_map.hasOwnProperty(language_id)) {
+        [delim, policy] = dialect_map[language_id];
         return [delim, policy, comment_prefix];
     }
-    if (!dialect_map.hasOwnProperty(language_id)) {
-        return [null, null, null];
+    // Here we don't check if language_id is DYNAMIC_CSV because we want to return the once selected dialect anyway even if file is now 'plaintext' or some other non-csv filetype.
+    if (extension_context.dynamic_document_dialects.has(document.fileName)) {
+        let dialect_info = extension_context.dynamic_document_dialects.get(document.fileName);
+        delim = dialect_info.delim;
+        policy = dialect_info.policy;
+        return [delim, policy, comment_prefix];
     }
-    [delim, policy] = dialect_map[language_id];
-    return [delim, policy, comment_prefix];
+    // The language id can be `dynamic csv` here e.g. if user just now manually selected the "Dynamic CSV" filetype.
+    return [null, null, null];
 }
 
 
 function show_status_bar_items(active_doc) {
+    if (dynamic_dialect_select_button) {
+        dynamic_dialect_select_button.hide();
+    }
     ll_rainbow_utils().show_lint_status_bar_button(vscode, extension_context, active_doc.fileName, active_doc.languageId);
     show_rbql_status_bar_button();
     show_align_shrink_button(active_doc.fileName);
@@ -264,7 +281,7 @@ function enable_dynamic_semantic_tokenization() {
 }
 
 
-function enable_comment_tokenization() {
+function register_comment_tokenization_handler() {
     let token_provider = new CommentTokenProvider();
     if (comment_token_event !== null) {
         comment_token_event.dispose();
@@ -280,6 +297,44 @@ function enable_comment_tokenization() {
 }
 
 
+async function get_dialect_from_user_dialog() {
+    let title = "Select separator character or string e.g. `,` or `:=`. For tab use `TAB`";
+    let input_box_props = {"prompt": title, "value": ','};
+    let delim = await vscode.window.showInputBox(input_box_props);
+    if (!delim) {
+        return [null, null];
+    }
+    let policy = (delim == ',' || delim == ';') ? QUOTED_RFC_POLICY : SIMPLE_POLICY;
+    return [delim, policy];
+}
+
+
+async function choose_dynamic_separator() {
+    let active_doc = get_active_doc();
+    if (active_doc.languageId != DYNAMIC_CSV) {
+        show_single_line_error('Dynamic separator can only be adjusted for "Dynamic CSV" filetype.');
+        return;
+    }
+    let [delim, policy] = await get_dialect_from_user_dialog();
+    if (!delim) {
+        show_single_line_error('Unable to use empty string separator');
+        return;
+    }
+    extension_context.dynamic_document_dialects.set(active_doc.fileName, {delim: delim, policy: policy});
+    await enable_rainbow_features_if_csv(active_doc);
+}
+
+
+function show_choose_dynamic_separator_button() {
+    if (!dynamic_dialect_select_button)
+        dynamic_dialect_select_button = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
+    dynamic_dialect_select_button.text = 'Choose Separator...';
+    dynamic_dialect_select_button.tooltip = 'Click to choose Dynamic CSV separator';
+    dynamic_dialect_select_button.command = 'rainbow-csv.ChooseDynamicSeparator';
+    dynamic_dialect_select_button.show();
+}
+
+
 async function enable_rainbow_features_if_csv(active_doc) {
     let file_path = active_doc ? active_doc.fileName : null;
     if (!active_doc || !file_path || file_path.endsWith('.git')) {
@@ -291,9 +346,41 @@ async function enable_rainbow_features_if_csv(active_doc) {
     if (!dialect_map.hasOwnProperty(language_id)) {
         return;
     }
-
+    let [delim, policy, comment_prefix] = get_dialect(active_doc);
+    if (!policy && extension_context.dynamic_dialect_for_next_request != null) {
+        [delim, policy] = extension_context.dynamic_dialect_for_next_request;
+        extension_context.dynamic_document_dialects.set(file_path, {delim: delim, policy: policy});
+        extension_context.dynamic_dialect_for_next_request = null;
+        [delim, policy, comment_prefix] = get_dialect(active_doc);
+    }
+    if (!policy) {
+        if (language_id == DYNAMIC_CSV) {
+            [delim, policy] = await get_dialect_from_user_dialog();
+            if (!policy) {
+                // Last attempt: retry getting dialect, because it can be set asynchronously: after opening the (which would trigger enable_rainbow_features_if_csv in the end) the caller could update dynamic_document_dialects for example this happens in RBQL queries handling.
+                [delim, policy, comment_prefix] = get_dialect(active_doc);
+            }
+            if (!policy) {
+                hide_buttons(); // Hide buttons when switching "csv" -> "dynamic csv".
+                show_choose_dynamic_separator_button();
+                return;
+            }
+            extension_context.dynamic_document_dialects.set(file_path, {delim: delim, policy: policy});
+        } else {
+            return;
+        }
+    }
+    if (!delim) {
+        return; // Adding this condition JIC, this should never happen at this point - we would return earlier if there were no policy (hence no delim).
+    }
     if (get_from_config('enable_cursor_position_info', false)) {
         keyboard_cursor_subscription = vscode.window.onDidChangeTextEditorSelection(handle_cursor_movement);
+    }
+    if (comment_prefix) {
+        // It is currently impoossible to set comment_prefix on document level, so we have to set it on language level instead.
+        // This could potentially cause minor problems in very rare situations.
+        // Applying 'setLanguageConfiguration' doesn't disable static configuration in language-configuration.json.
+        vscode.languages.setLanguageConfiguration(language_id, { comments: { lineComment: comment_prefix } });
     }
 
     if (language_id == DYNAMIC_CSV) {
@@ -305,9 +392,20 @@ async function enable_rainbow_features_if_csv(active_doc) {
 }
 
 
+function hide_buttons() {
+    let all_buttons = [extension_context.lint_status_bar_button, rbql_status_bar_button, rainbow_off_status_bar_button, copy_back_button, align_shrink_button, column_info_button, dynamic_dialect_select_button];
+    for (let i = 0; i < all_buttons.length; i++) {
+        if (all_buttons[i])
+            all_buttons[i].hide();
+    }
+}
+
+
 function disable_rainbow_features_if_non_csv(active_doc) {
     let file_path = active_doc ? active_doc.fileName : null;
     if (!active_doc) {
+        // This can happen when openning settings tab for example.
+        hide_buttons();
         return;
     }
     if (file_path && file_path.endsWith('.git')) {
@@ -317,11 +415,7 @@ function disable_rainbow_features_if_non_csv(active_doc) {
     var language_id = active_doc.languageId;
     if (dialect_map.hasOwnProperty(language_id))
         return;
-    let all_buttons = [extension_context.lint_status_bar_button, rbql_status_bar_button, rainbow_off_status_bar_button, copy_back_button, align_shrink_button, column_info_button];
-    for (let i = 0; i < all_buttons.length; i++) {
-        if (all_buttons[i])
-            all_buttons[i].hide();
-    }
+    hide_buttons();
     if (keyboard_cursor_subscription) {
         keyboard_cursor_subscription.dispose();
         keyboard_cursor_subscription = null;
@@ -537,18 +631,28 @@ async function show_warnings(warnings) {
 }
 
 
-async function handle_rbql_result_file(text_doc, delim, policy, warnings) {
-    // Settin dialect just in case.
-    extension_context.custom_document_dialects.set(text_doc.fileName, {delim: delim, policy: policy});
-    let language_id = map_dialect_to_language_id(delim, policy);
+async function handle_rbql_result_file_node(text_doc, delim, policy, warnings) {
     try {
         await vscode.window.showTextDocument(text_doc);
     } catch (error) {
         show_single_line_error('Unable to open RBQL result document');
         return;
     }
-    if (language_id && text_doc.language_id != language_id) {
+    let language_id = map_dialect_to_language_id(delim, policy);
+    if (language_id && text_doc.languageId != language_id) {
+        // In non-web version we open a new doc without preset filetype, so we need to manually set it.
         await vscode.languages.setTextDocumentLanguage(text_doc, language_id);
+    }
+    await show_warnings(warnings);
+}
+
+
+async function handle_rbql_result_file_web(text_doc, warnings) {
+    try {
+        await vscode.window.showTextDocument(text_doc);
+    } catch (error) {
+        show_single_line_error('Unable to open RBQL result document');
+        return;
     }
     await show_warnings(warnings);
 }
@@ -609,8 +713,16 @@ async function handle_command_result(src_table_path, dst_table_path, dst_delim, 
     // No need to close the RBQL console here, better to leave it open so it can be used to quickly adjust the query if needed.
     extension_context.autodetection_stoplist.add(dst_table_path);
     result_set_parent_map.set(safe_lower(dst_table_path), src_table_path);
+    extension_context.autodetection_temporarily_disabled_for_rbql = true;
+    let target_language_id = map_dialect_to_language_id(dst_delim, dst_policy);
     let doc = await vscode.workspace.openTextDocument(dst_table_path);
-    await handle_rbql_result_file(doc, dst_delim, dst_policy, warnings);
+    extension_context.autodetection_temporarily_disabled_for_rbql = false;
+    if (target_language_id == DYNAMIC_CSV) {
+        // TODO it would be better to set this before openTextDocument and adjust the logic so this would affect autodetection.
+        extension_context.dynamic_dialect_for_next_request = [dst_delim, dst_policy];
+    }
+    await handle_rbql_result_file_node(doc, dst_delim, dst_policy, warnings);
+    extension_context.dynamic_dialect_for_next_request = null;
 }
 
 
@@ -677,25 +789,40 @@ async function run_rbql_query(input_path, csv_encoding, backend_language, rbql_q
     if (backend_language == 'js') {
         let warnings = [];
         let result_doc = null;
+        let target_language_id = map_dialect_to_language_id(output_delim, output_policy);
         try {
             if (is_web_ext) {
                 let result_lines = await ll_rainbow_utils().rbql_query_web(rbql_query, rbql_context.input_document, input_delim, input_policy, output_delim, output_policy, warnings, with_headers, comment_prefix);
-                let output_doc_cfg = {content: result_lines.join('\n'), language: map_dialect_to_language_id(output_delim, output_policy)};
+                let output_doc_cfg = {content: result_lines.join('\n'), language: target_language_id};
+                if (target_language_id == DYNAMIC_CSV) {
+                    extension_context.dynamic_dialect_for_next_request = [output_delim, output_policy];
+                }
+                extension_context.autodetection_temporarily_disabled_for_rbql = true;
                 result_doc = await vscode.workspace.openTextDocument(output_doc_cfg);
+                extension_context.dynamic_dialect_for_next_request = null;
+                extension_context.autodetection_temporarily_disabled_for_rbql = false;
+                webview_report_handler(null, null);
+                await handle_rbql_result_file_web(result_doc, warnings);
             } else {
                 let csv_options = {'bulk_read': true};
                 await ll_rainbow_utils().rbql_query_node(global_state, rbql_query, input_path, input_delim, input_policy, output_path, output_delim, output_policy, csv_encoding, warnings, with_headers, comment_prefix, /*user_init_code=*/'', csv_options);
                 result_set_parent_map.set(safe_lower(output_path), input_path);
-                extension_context.autodetection_stoplist.add(output_path);
+                extension_context.autodetection_temporarily_disabled_for_rbql = true;
                 result_doc = await vscode.workspace.openTextDocument(output_path);
+                extension_context.autodetection_temporarily_disabled_for_rbql = false;
+                webview_report_handler(null, null);
+                if (target_language_id == DYNAMIC_CSV) {
+                    // TODO it would be better to set this before openTextDocument and adjust the logic so this would affect autodetection.
+                    extension_context.dynamic_dialect_for_next_request = [output_delim, output_policy];
+                }
+                await handle_rbql_result_file_node(result_doc, output_delim, output_policy, warnings);
+                extension_context.dynamic_dialect_for_next_request = null;
             }
         } catch (e) {
             let [error_type, error_msg] = ll_rbql_csv().exception_to_error_info(e);
             webview_report_handler(error_type, error_msg);
             return;
         }
-        webview_report_handler(null, null);
-        await handle_rbql_result_file(result_doc, output_delim, output_policy, warnings);
     } else {
         if (is_web_ext) {
             webview_report_handler('Input error', 'Python backend for RBQL is not supported in web version, please use JavaScript backend.');
@@ -739,7 +866,21 @@ async function set_header_line() {
 }
 
 
-async function set_rainbow_separator(policy=null) {
+function preserve_original_language_id_if_needed(file_path, original_language_id, original_language_ids) {
+    if (original_language_id == DYNAMIC_CSV) {
+        // This is to prevent invalid noop "dynamic csv" -> "dynamic csv" switch without carying dialect info.
+        return;
+    }
+    if (original_language_ids.has(file_path)) {
+        // Rainbow Off should act more like an actuall off i.e. return to the first filetype in the chain instead of the previous one.
+        return;
+    }
+    original_language_ids.set(file_path, original_language_id);
+}
+
+
+async function manually_set_rainbow_separator(policy=null) {
+    // The effect of manually setting the separator will disapear in the preview mode when the file is toggled in preview tab: see https://code.visualstudio.com/docs/getstarted/userinterface#_preview-mode
     let active_editor = get_active_editor();
     if (!active_editor)
         return;
@@ -756,6 +897,10 @@ async function set_rainbow_separator(policy=null) {
         return;
     }
     let separator = active_doc.lineAt(selection.start.line).text.substring(selection.start.character, selection.end.character);
+    if (!separator) {
+        show_single_line_error("Make nonempty separator selection with the cursor");
+        return;
+    }
     if (policy == QUOTED_RFC_POLICY && separator != ',' && separator != ';') {
         show_single_line_error("Only comma and semicolon separators are currently supported to use with multiline fields.");
         return;
@@ -764,10 +909,21 @@ async function set_rainbow_separator(policy=null) {
         policy = get_default_policy(separator);
     }
     let language_id = map_dialect_to_language_id(separator, policy);
-    extension_context.custom_document_dialects.set(active_doc.fileName, {delim: separator, policy: policy});
+    // Adding to stoplist just in case: this is the manual op, so the user now fully controls the filetype.
+    extension_context.autodetection_stoplist.add(active_doc.fileName);
+    if (language_id == DYNAMIC_CSV) {
+        extension_context.dynamic_document_dialects.set(active_doc.fileName, {delim: separator, policy: policy});
+    }
     let original_language_id = active_doc.languageId;
+    if (original_language_id == DYNAMIC_CSV && language_id == DYNAMIC_CSV) {
+        // We need to somehow explicitly re-tokenize file, because otherwise setTextDocumentLanguage would be a NO-OP, so we do this workaround with temporarily switching to plaintext and back.
+        extension_context.autodetection_stoplist.add(active_doc.fileName); // This is to avoid potential autodetection in plaintext.
+        extension_context.autodetection_temporarily_disabled_for_rbql = true;
+        active_doc = await vscode.languages.setTextDocumentLanguage(active_doc, 'plaintext');
+        extension_context.autodetection_temporarily_disabled_for_rbql = false;
+    }
     let doc = await vscode.languages.setTextDocumentLanguage(active_doc, language_id);
-    extension_context.original_language_ids.set(doc.fileName, original_language_id);
+    preserve_original_language_id_if_needed(doc.fileName, original_language_id, extension_context.original_language_ids);
 }
 
 
@@ -784,25 +940,24 @@ async function set_comment_prefix() {
         return;
     }
     let comment_prefix = active_doc.lineAt(selection.start.line).text.substring(selection.start.character, selection.end.character);
-    let dialect_info = new Object();
-    if (extension_context.custom_document_dialects.has(active_doc.fileName)) {
-        dialect_info = extension_context.custom_document_dialects.get(active_doc.fileName);
-    }
-    dialect_info['comment_prefix'] = comment_prefix;
-    extension_context.custom_document_dialects.set(active_doc.fileName, dialect_info);
+    extension_context.custom_comment_prefixes.set(active_doc.fileName, comment_prefix);
     if (!comment_prefix) {
         manual_comment_prefix_stoplist.add(active_doc.fileName);
     } else {
         manual_comment_prefix_stoplist.delete(active_doc.fileName);
+    }
+    if (comment_prefix) {
+        vscode.languages.setLanguageConfiguration(active_doc.languageId, { comments: { lineComment: comment_prefix } });
     }
     if (active_doc.languageId == DYNAMIC_CSV) {
         // Re-enable tokenization to explicitly trigger the highligthing. Sometimes this doesn't happen automatically.
         enable_dynamic_semantic_tokenization();
     } else {
         // Re-enable comment tokenization to explicitly adjust the comment highligthing (sometimes to disable it if comment prefix is set to an empty string).
-        enable_comment_tokenization();
+        register_comment_tokenization_handler();
     }
 }
+
 
 async function restore_original_language() {
     var active_doc = get_active_doc();
@@ -822,6 +977,8 @@ async function restore_original_language() {
     let doc = await vscode.languages.setTextDocumentLanguage(active_doc, original_language_id);
     extension_context.original_language_ids.delete(file_path);
     disable_rainbow_features_if_non_csv(doc);
+    // If the previous language is restored via native VSCode filetype selection the custom dialect info will be kept and in case of future manual Dynamic CSV selection the highlighting will be automatically activated without separator entry dialog.
+    extension_context.dynamic_document_dialects.delete(file_path);
 }
 
 
@@ -1350,6 +1507,11 @@ function autodetect_dialect_frequency_based(active_doc, candidate_separators, ma
 
 async function try_autoenable_rainbow_csv(vscode, config, extension_context, active_doc) {
     // VSCode to some extent is capable of "remembering" doc id in the previous invocation, at least when used in debug mode.
+
+    // VSCode may (and will?) forget documentId of a document "A" if document "B" is opened in the tab where "A" was (double VS single click in file browser panel).
+    // see https://code.visualstudio.com/docs/getstarted/userinterface#_preview-mode
+    if (extension_context.autodetection_temporarily_disabled_for_rbql)
+        return active_doc;
     if (!active_doc)
         return active_doc;
     if (!get_from_config('enable_separator_autodetection', false, config))
@@ -1376,11 +1538,13 @@ async function try_autoenable_rainbow_csv(vscode, config, extension_context, act
         return active_doc;
     // Intentionally do not store comment prefix used for autodetection in the dialect info since it is not file-specific anyway and is stored in the settings.
     // And in case if user changes it in the settings it would immediately affect the autodetected files.
-    extension_context.custom_document_dialects.set(active_doc.fileName, {delim: delim, policy: policy});
+    if (rainbow_csv_language_id == DYNAMIC_CSV)  {
+        extension_context.dynamic_document_dialects.set(active_doc.fileName, {delim: delim, policy: policy});
+    }
     if (rainbow_csv_language_id == original_language_id)
         return active_doc;
     let doc = await vscode.languages.setTextDocumentLanguage(active_doc, rainbow_csv_language_id);
-    extension_context.original_language_ids.set(file_path, original_language_id);
+    preserve_original_language_id_if_needed(file_path, original_language_id, extension_context.original_language_ids);
     return doc;
 }
 
@@ -1431,6 +1595,12 @@ function handle_cursor_movement(_unused_cursor_event) {
 
 
 async function handle_doc_open(active_doc) {
+    // The onDidOpenTextDocument handler will trigger for already "opened" docs too if they are re-opened in the same tab. Example
+    // Document "A" opens in tab1 -> triggers onDidOpenTextDocument
+    // Document "B" opens in tab1 -> triggers onDidOpenTextDocument  (this could happen if user clicks on document "B" in the left file browser panel)
+    // Document "A" opens in tab1 -> triggers onDidOpenTextDocument again! The previous languageId is reset.
+    // In other words if user opens a different document in the same tab (single click VS double click in the file browser panel) it may trigger the curent document closing and opening of a new doc.
+    // This behavior is called Preview Mode, see https://vscode.one/new-tab-vscode/ and https://code.visualstudio.com/docs/getstarted/userinterface#_preview-mode
     register_csv_copy_paste_for_empty_doc(active_doc);
     active_doc = await try_autoenable_rainbow_csv(vscode, vscode.workspace.getConfiguration('rainbow_csv'), extension_context, active_doc);
     disable_rainbow_features_if_non_csv(active_doc);
@@ -1522,8 +1692,8 @@ class RainbowTokenProvider {
     }
     async provideDocumentRangeSemanticTokens(document, range, _token) {
         let [delim, policy, comment_prefix] = get_dialect(document);
-        if (policy === null || (policy !== SIMPLE_POLICY && policy !== QUOTED_RFC_POLICY)) {
-            return null; // Sanity check: currently dynamic tokenization is enabled only for simple and quoted rfc policies.
+        if (!policy || document.languageId != DYNAMIC_CSV) {
+            return null;
         }
         let table_ranges = ll_rainbow_utils().parse_document_range(vscode, document, delim, policy, comment_prefix, range);
         // Create a new builder to clear the previous tokens.
@@ -1608,10 +1778,11 @@ async function activate(context) {
     var edit_column_names_cmd = vscode.commands.registerCommand('rainbow-csv.SetVirtualHeader', set_virtual_header);
     var set_join_table_name_cmd = vscode.commands.registerCommand('rainbow-csv.SetJoinTableName', set_join_table_name); // WEB_DISABLED
     var column_edit_before_cmd = vscode.commands.registerCommand('rainbow-csv.ColumnEditBefore', async function() { await column_edit('ce_before'); });
+    var choose_dynamic_separator_cmd = vscode.commands.registerCommand('rainbow-csv.ChooseDynamicSeparator', async function() { await choose_dynamic_separator(); });
     var column_edit_after_cmd = vscode.commands.registerCommand('rainbow-csv.ColumnEditAfter', async function() { await column_edit('ce_after'); });
     var column_edit_select_cmd = vscode.commands.registerCommand('rainbow-csv.ColumnEditSelect', async function() { await column_edit('ce_select'); });
-    var set_separator_cmd = vscode.commands.registerCommand('rainbow-csv.RainbowSeparator', () => { set_rainbow_separator(/*policy=*/null); });
-    var set_separator_cmd = vscode.commands.registerCommand('rainbow-csv.RainbowSeparatorMultiline', () => { set_rainbow_separator(QUOTED_RFC_POLICY); });
+    var set_separator_cmd = vscode.commands.registerCommand('rainbow-csv.RainbowSeparator', () => { manually_set_rainbow_separator(/*policy=*/null); });
+    var set_separator_multiline_cmd = vscode.commands.registerCommand('rainbow-csv.RainbowSeparatorMultiline', () => { manually_set_rainbow_separator(QUOTED_RFC_POLICY); });
     var rainbow_off_cmd = vscode.commands.registerCommand('rainbow-csv.RainbowSeparatorOff', restore_original_language);
     var sample_head_cmd = vscode.commands.registerCommand('rainbow-csv.SampleHead', async function(uri) { await make_preview(uri, 'head'); }); // WEB_DISABLED
     var sample_tail_cmd = vscode.commands.registerCommand('rainbow-csv.SampleTail', async function(uri) { await make_preview(uri, 'tail'); }); // WEB_DISABLED
@@ -1626,7 +1797,7 @@ async function activate(context) {
     enable_dynamic_semantic_tokenization();
 
     if (get_from_config('comment_prefix', null)) {
-        enable_comment_tokenization();
+        register_comment_tokenization_handler();
     }
 
     // The only purpose to add the entries to context.subscriptions is to guarantee their disposal during extension deactivation
@@ -1636,9 +1807,8 @@ async function activate(context) {
     context.subscriptions.push(column_edit_before_cmd);
     context.subscriptions.push(column_edit_after_cmd);
     context.subscriptions.push(column_edit_select_cmd);
-    context.subscriptions.push(doc_open_event);
-    context.subscriptions.push(switch_event);
     context.subscriptions.push(set_separator_cmd);
+    context.subscriptions.push(set_separator_multiline_cmd);
     context.subscriptions.push(rainbow_off_cmd);
     context.subscriptions.push(sample_head_cmd);
     context.subscriptions.push(sample_tail_cmd);
@@ -1649,6 +1819,10 @@ async function activate(context) {
     context.subscriptions.push(set_header_line_cmd);
     context.subscriptions.push(set_comment_prefix_cmd);
     context.subscriptions.push(internal_test_cmd);
+    context.subscriptions.push(choose_dynamic_separator_cmd);
+
+    context.subscriptions.push(doc_open_event);
+    context.subscriptions.push(switch_event);
 
 
     // Need this because "onDidOpenTextDocument()" doesn't get called for the first open document.

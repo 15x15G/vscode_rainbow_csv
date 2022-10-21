@@ -4,6 +4,7 @@
 * Make sure that hover info shows hover information in different colors corresponding to the column color in classical csv mode.
 * Make sure that comments are highlighted with a separate comment color (this can also be seen in integration tests).
 * Run `npm run lint`
+* Make sure that "Dynamic CSV" -> "Dynamic CSV" switch from one separator to another works.
 
 
 ### Debugging the extension:
@@ -130,7 +131,17 @@ Usage: `node markdown_to_html.js ~/vscode_rainbow_csv/rbql_core/README.md out.ht
 
 * Get rid of `csv (dot)` and similar dialects, since we now have dynamic csv to rule them all.
 
-* Update README.md with new commands and info.
+* Update README.md with new commands and info, especially describe "Dynamic CSV" dialect.
+
+* Consider removing double quote autoclosing from non-csv/scsv dialects when native rfc csv is enabled.
+
+* Manual selection of separator is not remembered in preview mode (unlike filetype selection through the menu) - consider remembering the selected separator in dialect_info (this is already done) with the special "is_manual" flag and during doc_open restore the dialect.
+
+* FIXME: Unlike manual filetype selection, setTextDocumentLanguage sometimes doesn't survive tab switch, this is especially reproducible with `dynamic csv` language and subsequent `Rainbow Off` command. Figure out how to overcome this.
+
+* Consider getting rid of Rainbow Off button.
+
+* For dynamic csv (whouth active policy/separator) add a button to the bottom panel to trigger the separator selection dialog.
 
 
 ## RFC Support plan
